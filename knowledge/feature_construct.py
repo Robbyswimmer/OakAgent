@@ -198,7 +198,9 @@ class SubtaskFormation:
                 'feature_name': feature_name,
                 'goal_type': 'minimize',
                 'target_value': self.config.OPTION_THETA_THRESHOLD,
-                'reward_fn': lambda state: -abs(state[2])  # -|theta|
+                'reward_fn': lambda state: -abs(state[2]),
+                'feature_predictor': feature_info.get('gvf'),
+                'tolerance': 0.01,
             }
 
         elif feature_name == 'centering':
@@ -208,7 +210,9 @@ class SubtaskFormation:
                 'feature_name': feature_name,
                 'goal_type': 'minimize',
                 'target_value': self.config.OPTION_X_THRESHOLD,
-                'reward_fn': lambda state: -abs(state[0])  # -|x|
+                'reward_fn': lambda state: -abs(state[0]),
+                'feature_predictor': feature_info.get('gvf'),
+                'tolerance': 0.02,
             }
 
         elif feature_name == 'stability':
@@ -218,7 +222,9 @@ class SubtaskFormation:
                 'feature_name': feature_name,
                 'goal_type': 'minimize',
                 'target_value': self.config.OPTION_VELOCITY_THRESHOLD,
-                'reward_fn': lambda state: -(abs(state[1]) + abs(state[3]))
+                'reward_fn': lambda state: -(abs(state[1]) + abs(state[3])),
+                'feature_predictor': feature_info.get('gvf'),
+                'tolerance': 0.05,
             }
 
         elif feature_name == 'survival':
@@ -227,8 +233,10 @@ class SubtaskFormation:
                 'name': f'maximize_{feature_name}',
                 'feature_name': feature_name,
                 'goal_type': 'maximize',
-                'target_value': float('inf'),
-                'reward_fn': lambda state: 1.0  # constant positive reward
+                'target_value': self.config.FC_SURVIVAL_TARGET,
+                'reward_fn': lambda state: 1.0,
+                'feature_predictor': feature_info.get('gvf'),
+                'tolerance': 5.0,
             }
 
         else:
@@ -238,7 +246,9 @@ class SubtaskFormation:
                 'feature_name': feature_name,
                 'goal_type': 'minimize',
                 'target_value': 0.1,
-                'reward_fn': lambda state: -feature_info['gvf'].predict(state)
+                'reward_fn': lambda state: -feature_info['gvf'].predict(state),
+                'feature_predictor': feature_info.get('gvf'),
+                'tolerance': 0.05,
             }
 
         self.subtasks.append(subtask)
@@ -312,6 +322,7 @@ class FCSTOMPManager:
         # Track FC-STOMP events
         self.fc_stomp_history = []
         self.last_run_step = 0
+        self.subtask_to_option = {}
 
     def run_fc_stomp_cycle(self, current_step, state_history=None, action_history=None):
         """
@@ -351,9 +362,10 @@ class FCSTOMPManager:
                 subtask = self.subtask_former.create_subtask(feature_info)
                 results['subtasks_formed'] += 1
 
-                # S: Check if we need a new option for this subtask
-                # (For now, we start with 4 core options, so skip dynamic creation)
-                # In full implementation, would create new option here
+                # S: ensure an option exists for this subtask
+                created = self._ensure_option_for_subtask(subtask)
+                if created:
+                    results['options_created'] += 1
 
         # Prune underperforming options
         options_to_prune = self.pruner.evaluate_options()
@@ -368,6 +380,33 @@ class FCSTOMPManager:
         self.last_run_step = current_step
 
         return results
+
+    def _ensure_option_for_subtask(self, subtask):
+        name = subtask['name']
+        if name in self.subtask_to_option:
+            return False
+
+        if (self.option_library is None or
+                not hasattr(self.option_library, 'create_option_from_subtask') or
+                self.option_models is None or
+                not hasattr(self.option_models, 'add_option') or
+                self.q_option is None or
+                not hasattr(self.q_option, 'add_option')):
+            self.subtask_to_option[name] = None
+            return False
+
+        option_id = self.option_library.create_option_from_subtask(subtask)
+        if option_id is None:
+            existing = None
+            if hasattr(self.option_library, 'subtask_option_map'):
+                existing = self.option_library.subtask_option_map.get(name)
+            self.subtask_to_option[name] = existing
+            return False
+
+        self.option_models.add_option(option_id)
+        self.q_option.add_option()
+        self.subtask_to_option[name] = option_id
+        return True
 
     def should_run(self, current_step):
         """Check if FC-STOMP should run at this step"""

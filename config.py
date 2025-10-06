@@ -40,6 +40,8 @@ class Config:
     OPTION_X_THRESHOLD = 0.1  # meters
     OPTION_VELOCITY_THRESHOLD = 0.5  # for stability
     OPTION_POLICY_HIDDEN = 64
+    OPTION_MODEL_MIN_ROLLOUTS = 5
+    OPTION_MODEL_ERROR_THRESHOLD = 1.0
 
     # Planner (Dyna)
     PLANNER_TYPE = "dyna"  # or "mpc"
@@ -64,6 +66,7 @@ class Config:
     FC_MIN_CONTROLLABILITY = 0.3  # min correlation with actions
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
     FC_OPTION_SUCCESS_THRESHOLD = 0.2  # min success rate to keep option
+    FC_SURVIVAL_TARGET = 200.0
 
     # Replay Buffers
     REPLAY_CAPACITY = 100000

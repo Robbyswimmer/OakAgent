@@ -40,6 +40,16 @@ class OaKAgent:
         self.config = config
         self.env = CartPoleEnv()
 
+        self.meta_config = None
+        if not config.ABLATION_NO_IDBD:
+            self.meta_config = {
+                'type': config.META_TYPE,
+                'mu': config.META_MU,
+                'init_log_alpha': config.META_INIT_LOG_ALPHA,
+                'min_alpha': config.META_MIN_ALPHA,
+                'max_alpha': config.META_MAX_ALPHA,
+            }
+
         # Replay buffers
         self.rb_real = ReplayBuffer(
             capacity=config.REPLAY_REAL_CAPACITY,
@@ -64,7 +74,9 @@ class OaKAgent:
         )
         self.option_models = OptionModelLibrary(
             state_dim=self.env.state_dim,
-            hidden_size=config.Q_OPTION_HIDDEN_SIZE
+            hidden_size=config.Q_OPTION_HIDDEN_SIZE,
+            min_rollouts=config.OPTION_MODEL_MIN_ROLLOUTS,
+            error_threshold=config.OPTION_MODEL_ERROR_THRESHOLD
         )
 
         # Options
@@ -79,12 +91,14 @@ class OaKAgent:
             state_dim=self.env.state_dim,
             action_dim=self.env.action_dim,
             gamma=config.Q_GAMMA,
-            target_sync_freq=config.Q_TARGET_SYNC_FREQ
+            target_sync_freq=config.Q_TARGET_SYNC_FREQ,
+            meta_config=self.meta_config
         )
         self.q_option = SMDPQNetwork(
             state_dim=self.env.state_dim,
             num_options=self.option_library.get_num_options(),
-            gamma=config.Q_GAMMA
+            gamma=config.Q_GAMMA,
+            meta_config=self.meta_config
         )
 
         # Planner
@@ -174,6 +188,16 @@ class OaKAgent:
                         state = s_end
                         episode_return += R_total
                         episode_length += duration
+                    else:
+                        # Fallback: execute a primitive action if option couldn't start
+                        action = self.q_primitive.select_action(state, epsilon=self.epsilon)
+                        next_state, reward, done, info = self.env.step(action)
+                        self.rb_real.add(state, action, reward, next_state, done)
+                        self.state_history.append(state)
+                        self.action_history.append(action)
+                        state = next_state
+                        episode_return += reward
+                        episode_length += 1
                 else:
                     # Execute primitive action
                     next_state, reward, done, info = self.env.step(action_or_option)
@@ -265,8 +289,7 @@ class OaKAgent:
                 self.q_primitive.update_td(s, a, r, s_next, done)
 
         # 5. Meta-learning (step-size updates)
-        # Note: IDBD integration would go here
-        # For now, using fixed step-sizes via optimizers
+        # Implemented within the Q-network update routines via TorchIDBD
 
     def evaluate(self, num_episodes):
         """Evaluate agent performance"""
@@ -338,8 +361,8 @@ def main():
     print("✓ 4. Model-Based Planning: Dyna with primitive + option models")
     print("✓ 5. Option-Centric Control: Planner uses options")
     print("✓ 6. No Train/Inference Split: Continual learning throughout")
-    print("✓ 7. Per-Weight Meta-Learning: IDBD/TIDBD (partial implementation)")
-    print("✓ 8. Hierarchical Self-Growth: FC-STOMP active")
+    print("✓ 7. Per-Weight Meta-Learning: IDBD/TIDBD via TorchIDBD")
+    print("✓ 8. Hierarchical Self-Growth: FC-STOMP with dynamic options")
     print("✓ 9. Predictive Reuse: Models simulate experience")
     print("✓ 10. Temporal Compositionality: Multi-timescale planning")
 

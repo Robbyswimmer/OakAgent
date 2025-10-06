@@ -72,14 +72,24 @@ class OptionModelLibrary:
     Maps option_id -> OptionModel
     """
 
-    def __init__(self, state_dim, hidden_size=128, lr=1e-3):
+    def __init__(
+        self,
+        state_dim,
+        hidden_size=128,
+        lr=1e-3,
+        min_rollouts=5,
+        error_threshold=None,
+    ):
         self.state_dim = state_dim
         self.hidden_size = hidden_size
         self.lr = lr
+        self.min_rollouts = min_rollouts
+        self.error_threshold = error_threshold
 
         # Dictionary: option_id -> (model, optimizer)
         self.models = {}
         self.prediction_errors = {}
+        self.experience_counts = {}
 
     def add_option(self, option_id):
         """Add a new option model"""
@@ -88,6 +98,7 @@ class OptionModelLibrary:
             optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
             self.models[option_id] = (model, optimizer)
             self.prediction_errors[option_id] = []
+            self.experience_counts[option_id] = 0
 
     def predict(self, option_id, state):
         """Predict SMDP outcome for option"""
@@ -96,6 +107,12 @@ class OptionModelLibrary:
             return state, 0.0, 1
 
         model, _ = self.models[option_id]
+        if not self.is_trained(option_id):
+            if isinstance(state, np.ndarray):
+                next_state = state.copy()
+            else:
+                next_state = np.array(state, dtype=np.float32)
+            return next_state, 0.0, 1
         return model.predict(state)
 
     def fit_from_rollout(self, option_id, s_start, s_end, R_total, duration):
@@ -145,6 +162,7 @@ class OptionModelLibrary:
 
         # Track error
         self.prediction_errors[option_id].append(loss.item())
+        self.experience_counts[option_id] += 1
 
         return loss.item()
 
@@ -181,3 +199,15 @@ class OptionModelLibrary:
     def get_all_option_ids(self):
         """Get list of all option IDs"""
         return list(self.models.keys())
+
+    def is_trained(self, option_id):
+        """Check whether an option model has sufficient data to be trustworthy."""
+        count = self.experience_counts.get(option_id, 0)
+        if count < self.min_rollouts:
+            return False
+
+        if self.error_threshold is None:
+            return True
+
+        avg_error = self.get_average_error(option_id, n=self.min_rollouts)
+        return avg_error <= self.error_threshold

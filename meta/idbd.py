@@ -147,74 +147,93 @@ class Autostep(IDBD):
 
 
 class TorchIDBD(nn.Module):
-    """
-    PyTorch-compatible IDBD for neural network training
-    Wraps optimizer and maintains per-parameter step-sizes
-    """
+    """PyTorch-compatible adaptive step-size wrapper."""
 
-    def __init__(self, parameters, mu=1e-3, init_log_alpha=None):
+    META_TYPES = {
+        "idbd": IDBD,
+        "tidbd": TIDBD,
+        "autostep": Autostep,
+    }
+
+    def __init__(
+        self,
+        parameters,
+        mu=1e-3,
+        init_log_alpha=None,
+        meta_type="idbd",
+        min_alpha=1e-6,
+        max_alpha=1.0,
+    ):
         super().__init__()
         self.mu = mu
 
-        # Flatten all parameters
         self.param_shapes = []
         self.param_sizes = []
         total_params = 0
 
         for param in parameters:
-            shape = param.shape
+            shape = tuple(param.shape)
             size = param.numel()
             self.param_shapes.append(shape)
             self.param_sizes.append(size)
             total_params += size
 
-        # Initialize IDBD for all parameters
-        self.idbd = IDBD(total_params, mu=mu, init_log_alpha=init_log_alpha)
+        meta_cls = self.META_TYPES.get(meta_type.lower(), IDBD)
+        self.idbd = meta_cls(
+            total_params,
+            mu=mu,
+            init_log_alpha=init_log_alpha,
+            min_alpha=min_alpha,
+            max_alpha=max_alpha,
+        )
 
     def get_step_sizes(self):
-        """Get step-sizes for all parameters"""
+        """Get flattened step-sizes for all tracked parameters."""
         return self.idbd.get_step_sizes()
 
     def update_step_sizes(self, gradients, features, td_error=None):
-        """
-        Update step-sizes for all parameters
+        """Update per-parameter step-sizes using current gradients."""
 
-        Args:
-            gradients: list of parameter gradients
-            features: input features (for eligibility)
-            td_error: optional TD error
+        usable_grads = [g for g in gradients if g is not None]
+        if not usable_grads:
+            return [torch.zeros(shape) for shape in self.param_shapes]
 
-        Returns:
-            list of step-sizes per parameter
-        """
-        # Flatten gradients
-        flat_grad = np.concatenate([g.detach().cpu().numpy().flatten()
-                                   for g in gradients])
+        flat_grad = np.concatenate(
+            [g.detach().cpu().numpy().reshape(-1) for g in usable_grads]
+        )
 
-        # Flatten features (use mean as proxy if needed)
         if isinstance(features, torch.Tensor):
             features = features.detach().cpu().numpy()
-        if features.ndim > 1:
+
+        if np.isscalar(features):
+            features = np.array([features], dtype=np.float32)
+
+        if features.ndim == 0:
+            features = features.reshape(1)
+        elif features.ndim > 1:
             features = features.mean(axis=0)
 
-        # Broadcast features to match gradient dimensions
-        feature_vector = np.tile(features, len(flat_grad) // len(features) + 1)[:len(flat_grad)]
+        if features.size == 0:
+            features = np.ones_like(flat_grad)
 
-        # Update IDBD
+        feature_vector = np.tile(features, len(flat_grad) // len(features) + 1)[
+            : len(flat_grad)
+        ]
+
         step_sizes = self.idbd.update(flat_grad, feature_vector, td_error)
 
-        # Reshape step-sizes back to parameter shapes
         step_sizes_list = []
         start = 0
         for size, shape in zip(self.param_sizes, self.param_shapes):
-            param_step_sizes = step_sizes[start:start+size].reshape(shape)
+            param_step_sizes = step_sizes[start : start + size].reshape(shape)
             step_sizes_list.append(torch.tensor(param_step_sizes))
             start += size
 
         return step_sizes_list
 
     def apply_updates(self, parameters, step_sizes_list):
-        """Apply step-size-scaled updates to parameters"""
+        """Apply scaled gradient steps to parameters."""
         for param, step_sizes in zip(parameters, step_sizes_list):
-            if param.grad is not None:
-                param.data -= step_sizes.to(param.device) * param.grad.data
+            if param.grad is None:
+                continue
+            param.data -= step_sizes.to(param.device) * param.grad.data
