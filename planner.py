@@ -55,6 +55,12 @@ class DynaPlanner:
         if len(start_states) == 0:
             return []
 
+        trained_option_ids = [
+            option_id
+            for option_id in self.option_models.get_all_option_ids()
+            if self.option_models.is_trained(option_id)
+        ]
+
         for _ in range(num_simulations):
             # Sample a random start state
             start_idx = np.random.randint(len(start_states))
@@ -63,11 +69,11 @@ class DynaPlanner:
             # Simulate a short rollout
             for step in range(self.horizon):
                 # Decide: use primitive action or option?
-                use_option = np.random.rand() < 0.3  # 30% option, 70% primitive
+                use_option = np.random.rand() < 0.3
 
-                if use_option and self.option_library.get_num_options() > 0:
+                if use_option and trained_option_ids:
                     # Simulate option execution
-                    option_id = np.random.randint(self.option_library.get_num_options())
+                    option_id = np.random.choice(trained_option_ids)
                     next_state, reward, duration = self.option_models.predict(option_id, state)
 
                     # Skip adding option transitions to primitive replay buffer
@@ -131,9 +137,13 @@ class DynaPlanner:
         # Epsilon-greedy with mixing of primitives and options
         if np.random.rand() < epsilon:
             # Random exploration
-            if np.random.rand() < 0.5 and self.option_library.get_num_options() > 0:
-                # Random option
-                option_id = np.random.randint(self.option_library.get_num_options())
+            available_options = [
+                option_id
+                for option_id in range(self.option_library.get_num_options())
+                if self.option_library.can_initiate(option_id, state)
+            ]
+            if np.random.rand() < 0.5 and available_options:
+                option_id = np.random.choice(available_options)
                 return option_id, True
             else:
                 # Random primitive
@@ -148,12 +158,22 @@ class DynaPlanner:
         # Check option Q-values
         if self.option_library.get_num_options() > 0:
             q_option_values = self.q_option.predict(state)
-            best_option_id = np.argmax(q_option_values)
-            best_option_q = q_option_values[best_option_id]
+            initiable_options = [
+                option_id
+                for option_id in range(self.option_library.get_num_options())
+                if self.option_library.can_initiate(option_id, state)
+            ]
 
-            # Choose between best primitive and best option
-            if best_option_q > best_primitive_q:
-                return best_option_id, True
+            if initiable_options:
+                masked_values = np.full_like(q_option_values, fill_value=-np.inf)
+                for option_id in initiable_options:
+                    masked_values[option_id] = q_option_values[option_id]
+
+                best_option_id = int(np.argmax(masked_values))
+                best_option_q = masked_values[best_option_id]
+
+                if best_option_q > best_primitive_q:
+                    return best_option_id, True
 
         return best_primitive_action, False
 

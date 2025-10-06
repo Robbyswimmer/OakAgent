@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from meta.idbd import TorchIDBD
+
 class OptionQNetwork(nn.Module):
     """Q-network for options"""
 
@@ -48,16 +50,39 @@ class SMDPQNetwork:
     Q_O(s, o) <- Q_O(s, o) + alpha * [R_o + gamma^tau * max_o' Q_O(s', o') - Q_O(s, o)]
     """
 
-    def __init__(self, state_dim, num_options, gamma=0.99, lr=1e-3):
+    def __init__(
+        self,
+        state_dim,
+        num_options,
+        gamma=0.99,
+        lr=1e-3,
+        meta_config=None,
+    ):
         self.state_dim = state_dim
         self.num_options = num_options
         self.gamma = gamma
+        self.base_lr = lr
 
         # Q-network
         self.q_net = OptionQNetwork(state_dim, num_options)
 
-        # Optimizer
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        self.meta_config = meta_config or {}
+        self.use_meta = meta_config is not None and not self.meta_config.get(
+            "disabled", False
+        )
+        self.meta_updater = None
+        self.optimizer = None
+        if self.use_meta:
+            self.meta_updater = TorchIDBD(
+                self.q_net.parameters(),
+                mu=self.meta_config.get("mu", 1e-3),
+                init_log_alpha=self.meta_config.get("init_log_alpha", np.log(lr)),
+                meta_type=self.meta_config.get("type", "idbd"),
+                min_alpha=self.meta_config.get("min_alpha", 1e-6),
+                max_alpha=self.meta_config.get("max_alpha", 1.0),
+            )
+        else:
+            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
 
         # Tracking
         self.td_errors = []
@@ -121,10 +146,17 @@ class SMDPQNetwork:
         # Loss
         loss = F.mse_loss(q_value, target_q_value)
 
-        # Backward pass
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        if self.use_meta and self.meta_updater is not None:
+            self.q_net.zero_grad(set_to_none=True)
+            loss.backward()
+            gradients = [param.grad for param in self.q_net.parameters()]
+            step_sizes = self.meta_updater.update_step_sizes(gradients, s_start)
+            self.meta_updater.apply_updates(self.q_net.parameters(), step_sizes)
+            self.q_net.zero_grad(set_to_none=True)
+        else:
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
         # Track TD error
         td_error = (target_q_value - q_value).abs().mean().item()
@@ -165,25 +197,43 @@ class SMDPQNetwork:
         recent_errors = self.td_errors[-n:]
         return np.mean(recent_errors)
 
+    def _reinit_meta(self):
+        if self.use_meta:
+            self.meta_updater = TorchIDBD(
+                self.q_net.parameters(),
+                mu=self.meta_config.get("mu", 1e-3),
+                init_log_alpha=self.meta_config.get("init_log_alpha", np.log(self.base_lr)),
+                meta_type=self.meta_config.get("type", "idbd"),
+                min_alpha=self.meta_config.get("min_alpha", 1e-6),
+                max_alpha=self.meta_config.get("max_alpha", 1.0),
+            )
+
     def add_option(self):
         """Dynamically add a new option (for FC-STOMP)"""
+        old_num = self.num_options
         self.num_options += 1
 
-        # Create new network with additional output
-        old_weights = self.q_net.state_dict()
-        self.q_net = OptionQNetwork(self.state_dim, self.num_options)
+        old_state = self.q_net.state_dict()
+        new_net = OptionQNetwork(self.state_dim, self.num_options)
+        new_state = new_net.state_dict()
 
-        # Initialize new option weights
-        # Copy old weights where possible
-        new_weights = self.q_net.state_dict()
-        for name, param in old_weights.items():
-            if name in new_weights and param.shape == new_weights[name].shape:
-                new_weights[name] = param
+        # Copy shared layers
+        for name, param in old_state.items():
+            if name not in new_state:
+                continue
+            if name.endswith("weight") and new_state[name].shape[0] == self.num_options and param.shape[0] == old_num:
+                new_state[name][:old_num] = param
+            elif name.endswith("bias") and new_state[name].shape[0] == self.num_options and param.shape[0] == old_num:
+                new_state[name][:old_num] = param
+            elif new_state[name].shape == param.shape:
+                new_state[name] = param
 
-        self.q_net.load_state_dict(new_weights)
+        new_net.load_state_dict(new_state)
+        self.q_net = new_net
 
-        # Update optimizer
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.optimizer.param_groups[0]['lr'])
+        if self.use_meta:
+            self._reinit_meta()
+        else:
+            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.base_lr)
 
-        # Initialize count for new option
         self.option_counts[self.num_options - 1] = 0
