@@ -2,7 +2,7 @@
 OaK-CartPole Configuration
 All hyperparameters following OaK principles from project_outline.md
 """
-import numpy as np
+import math
 
 class Config:
     # Environment
@@ -54,7 +54,7 @@ class Config:
     # Meta-Learning (IDBD/TIDBD/Autostep)
     META_TYPE = "idbd"  # "idbd", "tidbd", or "autostep"
     META_MU = 1e-3  # meta learning rate
-    META_INIT_LOG_ALPHA = np.log(1e-3)  # initial step-size
+    META_INIT_LOG_ALPHA = math.log(1e-3)  # initial step-size
     META_MIN_ALPHA = 1e-6
     META_MAX_ALPHA = 1.0
 
