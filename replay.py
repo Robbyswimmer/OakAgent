@@ -1,0 +1,145 @@
+"""
+Replay Buffers for OaK Agent
+- RB_real: stores real environment transitions
+- RB_sim: stores simulated (Dyna) transitions
+- Trajectory storage for option rollouts
+"""
+import numpy as np
+from collections import deque
+
+class ReplayBuffer:
+    """Ring buffer for storing transitions"""
+
+    def __init__(self, capacity, state_dim, action_dim=1):
+        self.capacity = capacity
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        # Pre-allocate arrays for efficiency
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.bool_)
+
+        self.ptr = 0
+        self.size = 0
+
+    def add(self, state, action, reward, next_state, done):
+        """Add a transition to the buffer"""
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr] = done
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size):
+        """Sample a random batch of transitions"""
+        indices = np.random.randint(0, self.size, size=batch_size)
+        return (
+            self.states[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_states[indices],
+            self.dones[indices]
+        )
+
+    def get_recent_states(self, n):
+        """Get n most recent states for Dyna planning"""
+        if self.size == 0:
+            return np.array([])
+
+        n = min(n, self.size)
+        if self.ptr >= n:
+            indices = np.arange(self.ptr - n, self.ptr)
+        else:
+            # Wrap around
+            indices = np.concatenate([
+                np.arange(self.capacity - (n - self.ptr), self.capacity),
+                np.arange(0, self.ptr)
+            ])
+        return self.states[indices]
+
+    def __len__(self):
+        return self.size
+
+
+class TrajectoryBuffer:
+    """
+    Buffer for storing option execution trajectories
+    Each trajectory is a sequence of (s, a, r, s', done) tuples
+    """
+
+    def __init__(self, capacity=1000):
+        self.capacity = capacity
+        self.trajectories = deque(maxlen=capacity)
+
+    def add_trajectory(self, trajectory):
+        """
+        Add a complete trajectory
+        trajectory: list of (s, a, r, s', done) tuples
+        """
+        self.trajectories.append(trajectory)
+
+    def sample_trajectory(self):
+        """Sample a random trajectory"""
+        if len(self.trajectories) == 0:
+            return []
+        idx = np.random.randint(len(self.trajectories))
+        return self.trajectories[idx]
+
+    def get_all_trajectories(self):
+        """Get all stored trajectories"""
+        return list(self.trajectories)
+
+    def __len__(self):
+        return len(self.trajectories)
+
+
+class OptionTrajectory:
+    """
+    Stores a single option execution trajectory
+    Computes SMDP quantities: cumulative reward R_o, duration τ, start/end states
+    """
+
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+
+    def add_step(self, state, action, reward, done):
+        """Add a step to the trajectory"""
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.dones.append(done)
+
+    def get_smdp_data(self):
+        """
+        Compute SMDP quantities for option model learning
+        Returns: (s_start, s_end, R_total, duration, trajectory)
+        """
+        if len(self.states) == 0:
+            return None
+
+        s_start = self.states[0]
+        s_end = self.states[-1]
+        R_total = sum(self.rewards)
+        duration = len(self.rewards)
+
+        trajectory = list(zip(
+            self.states[:-1],
+            self.actions,
+            self.rewards,
+            self.states[1:] if len(self.states) > 1 else [self.states[0]],
+            self.dones
+        ))
+
+        return s_start, s_end, R_total, duration, trajectory
+
+    def __len__(self):
+        return len(self.states)
