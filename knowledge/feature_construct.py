@@ -11,8 +11,60 @@ O: Option-Model Integration - integrate into planner
 M: Meta-Learning - adapt step-sizes
 P: Planning & Acting - use in decision-making
 """
-import numpy as np
+import math
 from collections import deque
+
+
+def _safe_mean(values):
+    """Return the arithmetic mean, handling empty sequences."""
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _safe_variance(values):
+    """Population variance that gracefully handles short sequences."""
+    n = len(values)
+    if n == 0:
+        return 0.0
+    mean_value = _safe_mean(values)
+    return sum((v - mean_value) ** 2 for v in values) / n
+
+
+def _safe_std(values):
+    """Population standard deviation for a sequence."""
+    variance = _safe_variance(values)
+    return math.sqrt(variance)
+
+
+def _diff(values):
+    """Compute first differences for a sequence."""
+    if len(values) < 2:
+        return []
+    return [values[i + 1] - values[i] for i in range(len(values) - 1)]
+
+
+def _correlation(x_values, y_values):
+    """Pearson correlation between two sequences."""
+    if not x_values or not y_values:
+        return 0.0
+
+    n = min(len(x_values), len(y_values))
+    x_values = x_values[:n]
+    y_values = y_values[:n]
+
+    mean_x = _safe_mean(x_values)
+    mean_y = _safe_mean(y_values)
+
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_values, y_values))
+    std_x = math.sqrt(sum((x - mean_x) ** 2 for x in x_values))
+    std_y = math.sqrt(sum((y - mean_y) ** 2 for y in y_values))
+
+    denom = std_x * std_y
+    if denom == 0:
+        return 0.0
+
+    return max(min(cov / denom, 1.0), -1.0)
 
 class FeatureConstructor:
     """
@@ -46,16 +98,14 @@ class FeatureConstructor:
             if len(predictions) < 100:
                 continue
 
-            predictions_array = np.array(predictions)
-
             # Criteria for promising features:
 
             # 1. Low variance (stable prediction)
-            variance = np.var(predictions_array)
+            variance = _safe_variance(predictions)
             is_stable = variance < self.config.FC_FEATURE_VARIANCE_THRESHOLD
 
             # 2. Bottleneck detection (low values that can be controlled)
-            mean_value = np.mean(predictions_array)
+            mean_value = _safe_mean(predictions)
             is_bottleneck = mean_value < 0.5  # threshold for "small" values
 
             # 3. High-value survival predictions
@@ -107,15 +157,15 @@ class FeatureConstructor:
             action_history = action_history + [0] * (len(feature_values) - len(action_history))
 
         # Measure how much feature changes when actions change
-        feature_diffs = np.diff(feature_values[:len(action_history)-1])
-        action_changes = np.diff(action_history[:len(feature_values)-1])
+        feature_diffs = _diff(feature_values[:len(action_history) - 1])
+        action_changes = _diff(action_history[:len(feature_values) - 1])
 
-        if len(feature_diffs) == 0 or np.std(action_changes) == 0:
+        if len(feature_diffs) == 0 or _safe_std(action_changes) == 0:
             return 0.0
 
         # Correlation
-        correlation = np.abs(np.corrcoef(feature_diffs, action_changes)[0, 1])
-        return correlation if not np.isnan(correlation) else 0.0
+        correlation = abs(_correlation(feature_diffs, action_changes))
+        return correlation if not math.isnan(correlation) else 0.0
 
 
 class SubtaskFormation:
