@@ -47,6 +47,46 @@ class ReplayBuffer:
             self.dones[indices]
         )
 
+    def _chronological_index(self, idx):
+        """Map chronological index to buffer slot."""
+        return (self.ptr - self.size + idx) % self.capacity
+
+    def sample_sequences(self, length, batch_size):
+        """Sample contiguous sequences of transitions of given length."""
+        if self.size < length or length <= 0:
+            return []
+
+        sequences = []
+        max_start = self.size - length
+        attempts = 0
+        max_attempts = batch_size * 5
+
+        while len(sequences) < batch_size and attempts < max_attempts:
+            start = np.random.randint(0, max_start + 1)
+            indices = [self._chronological_index(start + offset) for offset in range(length)]
+
+            states_seq = self.states[indices]
+            actions_seq = self.actions[indices].squeeze(-1)
+            rewards_seq = self.rewards[indices]
+            next_states_seq = self.next_states[indices]
+            dones_seq = self.dones[indices]
+
+            # Require trajectory to stay non-terminal until final transition
+            if np.any(dones_seq[:-1]):
+                attempts += 1
+                continue
+
+            sequences.append({
+                'states': states_seq.copy(),
+                'actions': actions_seq.copy(),
+                'rewards': rewards_seq.copy(),
+                'next_states': next_states_seq.copy(),
+                'dones': dones_seq.copy(),
+            })
+            attempts += 1
+
+        return sequences
+
     def get_recent_states(self, n):
         """Get n most recent states for Dyna planning"""
         if self.size == 0:

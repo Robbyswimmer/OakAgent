@@ -84,7 +84,7 @@ def plot_option_statistics(option_stats, save_path='results/option_stats.png'):
 
     executions = [option_stats[oid]['executions'] for oid in option_ids]
     success_rates = [option_stats[oid]['success_rate'] * 100 for oid in option_ids]
-    avg_durations = [option_stats[oid]['avg_duration'] for oid in option_ids]
+    avg_durations = [option_stats[oid]['avg_duration_steps'] for oid in option_ids]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
@@ -104,7 +104,7 @@ def plot_option_statistics(option_stats, save_path='results/option_stats.png'):
 
     # Average duration
     axes[2].bar(option_names, avg_durations, color='coral')
-    axes[2].set_title('Average Option Duration')
+    axes[2].set_title('Average Option Duration (steps)')
     axes[2].set_ylabel('Steps')
     axes[2].tick_params(axis='x', rotation=45)
 

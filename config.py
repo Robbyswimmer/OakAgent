@@ -30,7 +30,7 @@ class Config:
     # GVFs (Knowledge Layer)
     GVF_HIDDEN_SIZE = 64
     GVF_GAMMA_SHORT = 0.97  # for g1, g2, g3
-    GVF_GAMMA_LONG = 0.999  # for g4 (survival)
+    GVF_GAMMA_LONG = 0.99  # for g4 (survival, normalized horizon)
     GVF_TRAIN_STEPS = 15  # M3
     GVF_BUFFER_SIZE = 1000  # ring buffer for feature mining
 
@@ -40,8 +40,8 @@ class Config:
     OPTION_X_THRESHOLD = 0.1  # meters
     OPTION_VELOCITY_THRESHOLD = 0.5  # for stability
     OPTION_POLICY_HIDDEN = 64
-    OPTION_MODEL_MIN_ROLLOUTS = 5
-    OPTION_MODEL_ERROR_THRESHOLD = 1.5
+    OPTION_MODEL_MIN_ROLLOUTS = 2
+    OPTION_MODEL_ERROR_THRESHOLD = 2.0
 
     # Planner (Dyna)
     PLANNER_TYPE = "dyna"  # or "mpc"
@@ -62,14 +62,17 @@ class Config:
 
     # FC-STOMP (post-normalization thresholds for GVF values ∈ [0,1])
     FC_STOMP_FREQ = 500  # T_FC: env steps between feature construction
-    FC_FEATURE_VARIANCE_THRESHOLD = 0.12  # for stable features (normalized)
-    FC_FEATURE_INITIAL_VARIANCE = 0.12  # relaxed threshold early in training
-    FC_FEATURE_RELAX_STEPS = 800  # steps to use relaxed threshold
+    FC_FEATURE_VARIANCE_THRESHOLD = 0.04  # tighter gate once GVFs are normalized
+    FC_FEATURE_INITIAL_VARIANCE = 0.06  # relaxed threshold early in training
+    FC_FEATURE_RELAX_STEPS = 1200  # steps to use relaxed threshold
     FC_HISTORY_MIN_LENGTH = 20  # minimum samples before evaluating feature
-    FC_MIN_CONTROLLABILITY = 0.12  # min action contrast via model lookahead (warm-up)
+    FC_MIN_CONTROLLABILITY = 0.10  # min action contrast via model lookahead (warm-up)
+    FC_CONTROLLABILITY_H = 3  # horizon for model-based action contrast
+    FC_FEATURE_SPAWN_COOLDOWN = 400  # per-feature cooldown between spawned options
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
     FC_OPTION_SUCCESS_THRESHOLD = 0.10  # min success rate to keep option
     FC_SURVIVAL_TARGET = 200.0
+    FC_USAGE_WINDOW = 5  # episodes for option usage summaries
 
     # Replay Buffers
     REPLAY_CAPACITY = 100000

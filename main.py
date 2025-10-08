@@ -17,7 +17,7 @@ OaK Loop (from OaK_principles.md):
 """
 import numpy as np
 import torch
-from collections import deque
+from collections import deque, defaultdict
 import os
 import json
 
@@ -136,12 +136,16 @@ class OaKAgent:
         # Logging
         self.episode_returns = []
         self.episode_lengths = []
+        self.episode_option_stats = []
 
     def train(self, num_episodes):
         """Main training loop"""
         for episode in range(num_episodes):
             episode_return = 0
             episode_length = 0
+            episode_option_counts = defaultdict(int)
+            episode_option_durations = defaultdict(float)
+            episode_option_successes = defaultdict(int)
 
             state = self.env.reset()
             done = False
@@ -163,6 +167,11 @@ class OaKAgent:
                         R_total = sum([t[2] for t in trajectory])
                         duration = len(trajectory)
                         done = trajectory[-1][4]
+
+                        episode_option_counts[action_or_option] += 1
+                        episode_option_durations[action_or_option] += duration
+                        if success:
+                            episode_option_successes[action_or_option] += 1
 
                         # Store real transitions
                         for trans in trajectory:
@@ -245,6 +254,41 @@ class OaKAgent:
                             }
                             print(f"    GVF Means: {gvf_means}")
 
+                        horizon = getattr(self.config, 'FC_CONTROLLABILITY_H', 2)
+                        recent_states = list(self.state_history)[-self.config.GVF_BUFFER_SIZE :]
+                        if recent_states:
+                            delta_ctrl = {}
+                            for name, gvf in self.horde.gvfs.items():
+                                delta = self.fc_stomp.feature_constructor.compute_model_based_controllability(
+                                    gvf,
+                                    recent_states,
+                                    horizon=horizon,
+                                )
+                                delta_ctrl[name] = f"{delta:.3f}"
+                            print(f"    Δ{horizon} controllability: {delta_ctrl}")
+
+                        gvf_errors = self.horde.get_average_errors()
+                        gvf_norm = self.horde.get_normalized_errors()
+                        if gvf_errors:
+                            gvf_error_fmt = {
+                                name: f"{gvf_errors[name]:.3f}/{gvf_norm.get(name, 0.0):.3f}"
+                                for name in gvf_errors
+                            }
+                            print(f"    GVF error (MAE/norm): {gvf_error_fmt}")
+
+                        if len(self.rb_real) > 0:
+                            dyn_metrics = self.dyn_model.evaluate_errors(
+                                self.rb_real,
+                                batch_size=min(128, len(self.rb_real)),
+                                horizon=3,
+                            )
+                            if dyn_metrics['count_1'] > 0:
+                                print(
+                                    "    Dynamics MAE: "
+                                    f"1-step={dyn_metrics['mae_1']:.3f} (n={dyn_metrics['count_1']}), "
+                                    f"3-step={dyn_metrics['mae_3']:.3f} (n={dyn_metrics['count_3']})"
+                                )
+
                         # Log option usage stats
                         option_stats_list = []
                         for opt_id in self.option_library.get_option_ids():
@@ -254,12 +298,32 @@ class OaKAgent:
                             stats = option.get_statistics()
                             if stats['executions'] > 0:
                                 option_stats_list.append(
-                                    f"{opt_id}:{stats['executions']}x/{stats['avg_duration']:.1f}s/{stats['success_rate']*100:.0f}%"
+                                    f"{opt_id}:{stats['executions']}x/{stats['avg_duration_steps']:.1f}st/{stats['success_rate']*100:.0f}%"
                                 )
                         if option_stats_list:
                             print(f"    Options: [{', '.join(option_stats_list)}]")
 
+                        usage_summary = self._summarize_option_usage()
+                        if usage_summary:
+                            window = getattr(self.config, 'FC_USAGE_WINDOW', 5)
+                            print(f"    Option usage (last {window} ep): [{usage_summary}]")
+
+                        option_model_errors = {}
+                        if hasattr(self.option_models, 'get_all_option_ids'):
+                            for opt_id in self.option_models.get_all_option_ids():
+                                option_model_errors[opt_id] = self.option_models.get_average_error(opt_id, n=20)
+                        if option_model_errors:
+                            error_fmt = {
+                                opt_id: f"{err:.3f}" for opt_id, err in option_model_errors.items()
+                            }
+                            print(f"    Option-model MAE: {error_fmt}")
+
             # Episode complete
+            self.episode_option_stats.append({
+                'counts': dict(episode_option_counts),
+                'durations': dict(episode_option_durations),
+                'successes': dict(episode_option_successes),
+            })
             self.episode_returns.append(episode_return)
             self.episode_lengths.append(episode_length)
 
@@ -308,7 +372,7 @@ class OaKAgent:
                 s, a, r, s_next, done = batch
                 # Update all GVFs
                 for i in range(len(s)):
-                    self.horde.update_all(s[i], s_next[i])
+                    self.horde.update_all(s[i], s_next[i], done[i])
 
         # 4. Dyna imagination (planning)
         if not self.config.ABLATION_NO_PLANNING:
@@ -324,6 +388,35 @@ class OaKAgent:
 
         # 5. Meta-learning (step-size updates)
         # Implemented within the Q-network update routines via TorchIDBD
+
+    def _summarize_option_usage(self, window=None):
+        """Summarize recent option usage for logging."""
+        if not self.episode_option_stats:
+            return ""
+
+        window = window or getattr(self.config, 'FC_USAGE_WINDOW', 5)
+        recent_stats = self.episode_option_stats[-window:]
+        aggregate = {}
+
+        for stats in recent_stats:
+            for opt_id, count in stats['counts'].items():
+                if count == 0:
+                    continue
+                entry = aggregate.setdefault(opt_id, {'starts': 0, 'duration': 0.0, 'success': 0})
+                entry['starts'] += count
+                entry['duration'] += stats['durations'].get(opt_id, 0.0)
+                entry['success'] += stats['successes'].get(opt_id, 0)
+
+        parts = []
+        for opt_id in sorted(aggregate.keys()):
+            starts = aggregate[opt_id]['starts']
+            if starts == 0:
+                continue
+            avg_duration = aggregate[opt_id]['duration'] / max(starts, 1)
+            success_rate = aggregate[opt_id]['success'] / max(starts, 1)
+            parts.append(f"{opt_id}:{starts}x/{avg_duration:.1f}st/{success_rate*100:.0f}%")
+
+        return ', '.join(parts)
 
     def evaluate(self, num_episodes):
         """Evaluate agent performance"""

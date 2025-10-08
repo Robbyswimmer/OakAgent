@@ -249,11 +249,11 @@ class Option:
             return {
                 'executions': 0,
                 'success_rate': 0.0,
-                'avg_duration': 0.0
+                'avg_duration_steps': 0.0
             }
 
         return {
             'executions': self.execution_count,
             'success_rate': self.success_count / self.execution_count,
-            'avg_duration': self.total_duration / self.execution_count
+            'avg_duration_steps': self.total_duration / self.execution_count
         }
