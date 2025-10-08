@@ -276,7 +276,7 @@ class FeatureConstructor:
         score = float(np.tanh(2.5 * score))  # squash to [0, 1)
         return max(0.0, min(1.0, score))
 
-    def compute_model_based_controllability(self, gvf, recent_states, horizon=2):
+    def compute_model_based_controllability(self, gvf, recent_states, horizon=4):
         """
         Model-based controllability via action contrast lookahead.
 
@@ -294,8 +294,8 @@ class FeatureConstructor:
         if self.dyn_model is None or not recent_states:
             return 0.0
 
-        # Sample up to 50 states for efficiency
-        n_samples = min(50, len(recent_states))
+        # Sample up to 200 states for efficiency
+        n_samples = min(200, len(recent_states))
         if n_samples < 10:
             return 0.0
 
@@ -343,13 +343,28 @@ class FeatureConstructor:
             # Contrast between actions
             if len(action_scores) == 2:
                 contrast = abs(action_scores[0] - action_scores[1])
-                if np.isfinite(contrast):
-                    contrasts.append(contrast)
+                mean_prediction = np.mean(np.abs(action_scores))
+                if np.isfinite(contrast) and np.isfinite(mean_prediction):
+                    contrasts.append((contrast, mean_prediction))
 
         if not contrasts:
             return 0.0
 
-        return float(np.mean(contrasts))
+        if not contrasts:
+            return 0.0
+
+        contrasts = np.array(contrasts, dtype=np.float64)
+
+        # Each tuple: (contrast, mean_prediction)
+        contrast_vals = contrasts[:, 0]
+        scale_vals = np.clip(contrasts[:, 1], a_min=1e-3, a_max=None)
+
+        # Relative contrast: how much one action changes prediction vs typical magnitude
+        relative = contrast_vals / scale_vals
+
+        # Smooth squashing keeps score in [0,1)
+        score = float(np.tanh(relative.mean()))
+        return max(0.0, min(1.0, score))
 
 
 class SubtaskFormation:

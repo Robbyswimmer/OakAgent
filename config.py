@@ -66,7 +66,7 @@ class Config:
     FC_FEATURE_INITIAL_VARIANCE = 0.12  # relaxed threshold early in training
     FC_FEATURE_RELAX_STEPS = 800  # steps to use relaxed threshold
     FC_HISTORY_MIN_LENGTH = 20  # minimum samples before evaluating feature
-    FC_MIN_CONTROLLABILITY = 0.25  # min action contrast via model lookahead
+    FC_MIN_CONTROLLABILITY = 0.12  # min action contrast via model lookahead (warm-up)
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
     FC_OPTION_SUCCESS_THRESHOLD = 0.10  # min success rate to keep option
     FC_SURVIVAL_TARGET = 200.0
