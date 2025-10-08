@@ -576,6 +576,10 @@ class FCSTOMPManager:
         for option_id in options_to_prune:
             # Only prune if not a core option (keep 0-3)
             if option_id >= 4:
+                if hasattr(self.option_models, 'remove_option'):
+                    self.option_models.remove_option(option_id)
+                if hasattr(self.q_option, 'reset_option'):
+                    self.q_option.reset_option(option_id)
                 self.pruner.prune_option(option_id)
                 results['options_pruned'] += 1
 
@@ -590,25 +594,34 @@ class FCSTOMPManager:
         if name in self.subtask_to_option:
             return False
 
-        if (self.option_library is None or
-                not hasattr(self.option_library, 'create_option_from_subtask') or
-                self.option_models is None or
-                not hasattr(self.option_models, 'add_option') or
-                self.q_option is None or
-                not hasattr(self.q_option, 'add_option')):
+        if (
+            self.option_library is None
+            or not hasattr(self.option_library, 'create_option_from_subtask')
+            or self.option_models is None
+            or not hasattr(self.option_models, 'add_option')
+            or self.q_option is None
+            or not hasattr(self.q_option, 'add_option')
+        ):
             self.subtask_to_option[name] = None
             return False
 
-        option_id = self.option_library.create_option_from_subtask(subtask)
-        if option_id is None:
+        create_result = self.option_library.create_option_from_subtask(subtask)
+        if create_result is None:
             existing = None
             if hasattr(self.option_library, 'subtask_option_map'):
                 existing = self.option_library.subtask_option_map.get(name)
             self.subtask_to_option[name] = existing
             return False
 
+        option_id, is_new_slot = create_result
+
+        # Reinitialize or add supporting models/q-values
         self.option_models.add_option(option_id)
-        self.q_option.add_option()
+        if hasattr(self.q_option, 'reset_option') and not is_new_slot:
+            self.q_option.reset_option(option_id)
+        else:
+            self.q_option.add_option()
+
         self.subtask_to_option[name] = option_id
         return True
 

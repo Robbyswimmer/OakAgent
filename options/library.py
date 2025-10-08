@@ -130,67 +130,63 @@ class OptionLibrary:
         self.config = config
 
         # Create initial 4 core options
-        self.options = {}
+        self.options = []  # index -> Option or None
         self.subtask_option_map = {}
         self._create_core_options()
-
-        # Track next option ID for dynamic creation
-        self.next_option_id = len(self.options)
 
     def _create_core_options(self):
         """Create the 4 core GVF-derived options"""
         # o1: Upright Left (for positive theta)
-        self.options[0] = UprightOption(
-            option_id=0,
-            name="upright_left",
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            theta_threshold=self.config.OPTION_THETA_THRESHOLD,
-            preferred_direction=1,
-            max_length=self.config.OPTION_MAX_LENGTH
-        )
+        core_options = [
+            UprightOption(
+                option_id=0,
+                name="upright_left",
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                theta_threshold=self.config.OPTION_THETA_THRESHOLD,
+                preferred_direction=1,
+                max_length=self.config.OPTION_MAX_LENGTH,
+            ),
+            UprightOption(
+                option_id=1,
+                name="upright_right",
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                theta_threshold=self.config.OPTION_THETA_THRESHOLD,
+                preferred_direction=-1,
+                max_length=self.config.OPTION_MAX_LENGTH,
+            ),
+            CenteringOption(
+                option_id=2,
+                name="centering",
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                x_threshold=self.config.OPTION_X_THRESHOLD,
+                max_length=self.config.OPTION_MAX_LENGTH,
+            ),
+            StabilizeOption(
+                option_id=3,
+                name="stabilize",
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                velocity_threshold=self.config.OPTION_VELOCITY_THRESHOLD,
+                max_length=self.config.OPTION_MAX_LENGTH,
+            ),
+        ]
 
-        # o2: Upright Right (for negative theta)
-        self.options[1] = UprightOption(
-            option_id=1,
-            name="upright_right",
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            theta_threshold=self.config.OPTION_THETA_THRESHOLD,
-            preferred_direction=-1,
-            max_length=self.config.OPTION_MAX_LENGTH
-        )
-
-        # o3: Centering
-        self.options[2] = CenteringOption(
-            option_id=2,
-            name="centering",
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            x_threshold=self.config.OPTION_X_THRESHOLD,
-            max_length=self.config.OPTION_MAX_LENGTH
-        )
-
-        # o4: Stabilize
-        self.options[3] = StabilizeOption(
-            option_id=3,
-            name="stabilize",
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            velocity_threshold=self.config.OPTION_VELOCITY_THRESHOLD,
-            max_length=self.config.OPTION_MAX_LENGTH
-        )
-
-        for option in self.options.values():
-            self.subtask_option_map[option.name] = option.option_id
+        for option in core_options:
+            option_id, _ = self.add_option(option)
+            self.subtask_option_map[option.name] = option_id
 
     def get_option(self, option_id):
         """Get option by ID"""
-        return self.options.get(option_id)
+        if 0 <= option_id < len(self.options):
+            return self.options[option_id]
+        return None
 
     def get_all_options(self):
         """Get all options"""
-        return self.options.copy()
+        return {idx: opt for idx, opt in enumerate(self.options) if opt is not None}
 
     def get_num_options(self):
         """Get number of options"""
@@ -198,9 +194,27 @@ class OptionLibrary:
 
     def add_option(self, option):
         """Dynamically add a new option (for FC-STOMP)"""
-        self.options[self.next_option_id] = option
-        self.next_option_id += 1
-        return self.next_option_id - 1
+        option_id = option.option_id if option.option_id is not None and option.option_id >= 0 else None
+        appended = False
+
+        if option_id is None:
+            # Reuse freed slot if available
+            for idx, existing in enumerate(self.options):
+                if existing is None:
+                    option_id = idx
+                    break
+            if option_id is None:
+                option_id = len(self.options)
+                self.options.append(None)
+                appended = True
+        else:
+            while option_id >= len(self.options):
+                self.options.append(None)
+                appended = True
+
+        option.option_id = option_id
+        self.options[option_id] = option
+        return option_id, appended
 
     def can_initiate(self, option_id, state):
         option = self.get_option(option_id)
@@ -213,16 +227,22 @@ class OptionLibrary:
 
     def remove_option(self, option_id):
         """Remove an option (pruning)"""
-        if option_id in self.options:
-            del self.options[option_id]
+        if 0 <= option_id < len(self.options):
+            self.options[option_id] = None
         to_delete = [name for name, oid in self.subtask_option_map.items() if oid == option_id]
         for name in to_delete:
             del self.subtask_option_map[name]
 
+    def get_option_ids(self):
+        """Return list of active option IDs."""
+        return [idx for idx, opt in enumerate(self.options) if opt is not None]
+
     def get_statistics(self):
         """Get statistics for all options"""
         stats = {}
-        for option_id, option in self.options.items():
+        for option_id, option in enumerate(self.options):
+            if option is None:
+                continue
             stats[option_id] = option.get_statistics()
         return stats
 
@@ -230,7 +250,7 @@ class OptionLibrary:
         """Execute a specific option in environment"""
         option = self.get_option(option_id)
         if option is None:
-            raise ValueError(f"Option {option_id} does not exist")
+            return [], False
 
         if env.state is None:
             return [], False
@@ -252,10 +272,8 @@ class OptionLibrary:
         if self.has_subtask_option(subtask['name']):
             return None
 
-        option_id = self.next_option_id if option_id is None else option_id
-
         option = ConstructedOption(
-            option_id=option_id,
+            option_id=option_id if option_id is not None else -1,
             name=f"fc_{subtask['name']}",
             state_dim=self.state_dim,
             action_dim=self.action_dim,
@@ -263,9 +281,9 @@ class OptionLibrary:
             max_length=self.config.OPTION_MAX_LENGTH,
         )
 
-        assigned_id = self.add_option(option)
+        assigned_id, is_new_slot = self.add_option(option)
         self.register_subtask_option(subtask['name'], assigned_id)
-        return assigned_id
+        return assigned_id, is_new_slot
 
 
 class ConstructedOption(Option):

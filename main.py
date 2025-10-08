@@ -122,7 +122,7 @@ class OaKAgent:
         )
 
         # Register option models for all options
-        for option_id in range(self.option_library.get_num_options()):
+        for option_id in self.option_library.get_option_ids():
             self.option_models.add_option(option_id)
 
         # Training state
@@ -189,6 +189,7 @@ class OaKAgent:
                         state = s_end
                         episode_return += R_total
                         episode_length += duration
+                        steps_elapsed = max(1, duration)
                     else:
                         # Fallback: execute a primitive action if option couldn't start
                         action = self.q_primitive.select_action(state, epsilon=self.epsilon)
@@ -199,6 +200,7 @@ class OaKAgent:
                         state = next_state
                         episode_return += reward
                         episode_length += 1
+                        steps_elapsed = 1
                 else:
                     # Execute primitive action
                     next_state, reward, done, info = self.env.step(action_or_option)
@@ -211,43 +213,51 @@ class OaKAgent:
                     state = next_state
                     episode_return += reward
                     episode_length += 1
+                    steps_elapsed = 1
 
                 # Learn everything continually
                 self._update_all_components()
 
-                # FC-STOMP periodically
-                if self.fc_stomp.should_run(self.total_steps):
-                    fc_results = self.fc_stomp.run_fc_stomp_cycle(
-                        self.total_steps,
-                        list(self.state_history),
-                        list(self.action_history)
-                    )
-                    # Enhanced FC-STOMP logging
-                    print(f"  FC-STOMP @ step {fc_results['step']}:")
-                    print(f"    Mined={fc_results['features_mined']}, Subtasks={fc_results['subtasks_formed']}, Created={fc_results['options_created']}, Pruned={fc_results['options_pruned']}")
+                # FC-STOMP periodically (respect actual env steps elapsed)
+                for _ in range(steps_elapsed):
+                    self.total_steps += 1
+                    if self.fc_stomp.should_run(self.total_steps):
+                        fc_results = self.fc_stomp.run_fc_stomp_cycle(
+                            self.total_steps,
+                            list(self.state_history),
+                            list(self.action_history)
+                        )
+                        # Enhanced FC-STOMP logging
+                        print(f"  FC-STOMP @ step {fc_results['step']}:")
+                        print(f"    Mined={fc_results['features_mined']}, Subtasks={fc_results['subtasks_formed']}, Created={fc_results['options_created']}, Pruned={fc_results['options_pruned']}")
 
-                    # Log controllability scores per GVF
-                    if fc_results.get('feature_stats'):
-                        ctrl_scores = {fs['name']: f"{fs.get('controllability', 0.0):.3f}"
-                                      for fs in fc_results['feature_stats']}
-                        print(f"    Controllability: {ctrl_scores}")
+                        # Log controllability scores per GVF
+                        if fc_results.get('feature_stats'):
+                            ctrl_scores = {
+                                fs['name']: f"{fs.get('controllability', 0.0):.3f}"
+                                for fs in fc_results['feature_stats']
+                            }
+                            print(f"    Controllability: {ctrl_scores}")
 
-                        gvf_means = {fs['name']: f"{fs.get('mean', 0.0):.2f}"
-                                    for fs in fc_results['feature_stats']}
-                        print(f"    GVF Means: {gvf_means}")
+                            gvf_means = {
+                                fs['name']: f"{fs.get('mean', 0.0):.2f}"
+                                for fs in fc_results['feature_stats']
+                            }
+                            print(f"    GVF Means: {gvf_means}")
 
-                    # Log option usage stats
-                    option_stats_list = []
-                    for opt_id in range(self.option_library.get_num_options()):
-                        stats = self.option_library.get_option(opt_id).get_statistics()
-                        if stats['executions'] > 0:
-                            option_stats_list.append(
-                                f"{opt_id}:{stats['executions']}x/{stats['avg_duration']:.1f}s/{stats['success_rate']*100:.0f}%"
-                            )
-                    if option_stats_list:
-                        print(f"    Options: [{', '.join(option_stats_list)}]")
-
-                self.total_steps += 1
+                        # Log option usage stats
+                        option_stats_list = []
+                        for opt_id in self.option_library.get_option_ids():
+                            option = self.option_library.get_option(opt_id)
+                            if option is None:
+                                continue
+                            stats = option.get_statistics()
+                            if stats['executions'] > 0:
+                                option_stats_list.append(
+                                    f"{opt_id}:{stats['executions']}x/{stats['avg_duration']:.1f}s/{stats['success_rate']*100:.0f}%"
+                                )
+                        if option_stats_list:
+                            print(f"    Options: [{', '.join(option_stats_list)}]")
 
             # Episode complete
             self.episode_returns.append(episode_return)

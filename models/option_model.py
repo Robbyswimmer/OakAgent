@@ -93,12 +93,17 @@ class OptionModelLibrary:
 
     def add_option(self, option_id):
         """Add a new option model"""
-        if option_id not in self.models:
-            model = OptionModel(self.state_dim, self.hidden_size)
-            optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
-            self.models[option_id] = (model, optimizer)
-            self.prediction_errors[option_id] = []
-            self.experience_counts[option_id] = 0
+        model = OptionModel(self.state_dim, self.hidden_size)
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        self.models[option_id] = (model, optimizer)
+        self.prediction_errors[option_id] = []
+        self.experience_counts[option_id] = 0
+
+    def remove_option(self, option_id):
+        """Remove model artifacts for an option."""
+        self.models.pop(option_id, None)
+        self.prediction_errors.pop(option_id, None)
+        self.experience_counts.pop(option_id, None)
 
     def predict(self, option_id, state):
         """Predict SMDP outcome for option"""
@@ -198,7 +203,7 @@ class OptionModelLibrary:
 
     def get_all_option_ids(self):
         """Get list of all option IDs"""
-        return list(self.models.keys())
+        return sorted(self.models.keys())
 
     def is_trained(self, option_id):
         """Check whether an option model has sufficient data to be trustworthy."""

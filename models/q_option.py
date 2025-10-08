@@ -237,3 +237,25 @@ class SMDPQNetwork:
             self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.base_lr)
 
         self.option_counts[self.num_options - 1] = 0
+
+    def reset_option(self, option_id):
+        """Reinitialize an existing option head without changing network size."""
+        if option_id < 0 or option_id >= self.num_options:
+            return
+
+        last_layer = None
+        for layer in self.q_net.net:
+            if isinstance(layer, nn.Linear):
+                last_layer = layer
+
+        if last_layer is not None and option_id < last_layer.weight.shape[0]:
+            with torch.no_grad():
+                nn.init.zeros_(last_layer.weight[option_id])
+                if last_layer.bias is not None:
+                    last_layer.bias[option_id] = 0.0
+
+        self.option_counts[option_id] = 0
+
+        # Refresh meta learner to avoid stale step-size state
+        if self.use_meta:
+            self._reinit_meta()
