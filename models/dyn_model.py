@@ -208,3 +208,47 @@ class DynamicsEnsemble:
             return 0.0
         recent_errors = self.prediction_errors[-n:]
         return np.mean(recent_errors)
+
+    def evaluate_errors(self, replay_buffer, batch_size=128, horizon=3):
+        """Compute 1-step and multi-step MAE using the replay buffer."""
+        if len(replay_buffer) == 0:
+            return {'mae_1': 0.0, 'mae_3': 0.0, 'count_1': 0, 'count_3': 0}
+
+        batch_size = min(batch_size, len(replay_buffer))
+        states, actions, _, next_states, _ = replay_buffer.sample(batch_size)
+        actions = actions.squeeze(-1)
+
+        pred_next, _ = self.predict(states, actions)
+        if isinstance(pred_next, torch.Tensor):
+            pred_next = pred_next.cpu().numpy()
+
+        mae_1 = float(np.mean(np.abs(pred_next - next_states)))
+
+        sequences = replay_buffer.sample_sequences(horizon, batch_size)
+        multi_errors = []
+        for seq in sequences:
+            s_pred = seq['states'][0]
+            valid = True
+            for step in range(horizon):
+                action = int(seq['actions'][step])
+                next_pred, _ = self.predict(s_pred, action)
+                if isinstance(next_pred, torch.Tensor):
+                    next_pred = next_pred.squeeze(0).cpu().numpy()
+                if seq['dones'][step]:
+                    valid = False
+                    break
+                s_pred = next_pred
+
+            if not valid:
+                continue
+
+            target_state = seq['next_states'][horizon - 1]
+            multi_errors.append(np.mean(np.abs(s_pred - target_state)))
+
+        mae_3 = float(np.mean(multi_errors)) if multi_errors else 0.0
+        return {
+            'mae_1': mae_1,
+            'mae_3': mae_3,
+            'count_1': batch_size,
+            'count_3': len(multi_errors),
+        }

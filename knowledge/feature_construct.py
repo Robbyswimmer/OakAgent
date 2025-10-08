@@ -85,6 +85,7 @@ class FeatureConstructor:
 
         # History for analysis
         self.feature_history = deque(maxlen=1000)
+        self.controllability_log = deque(maxlen=200)
 
     def mine_features(self, state_history=None, current_step=0):
         """
@@ -162,7 +163,7 @@ class FeatureConstructor:
             is_bottleneck = mean_value < 0.3  # threshold for "small" values (normalized GVFs)
 
             # 3. High-value survival predictions
-            is_high_value = gvf_name == 'survival' and mean_value > 100
+            is_high_value = gvf_name == 'survival' and mean_value > 0.6
 
             dropped = invalid_counts.get(gvf_name, 0)
 
@@ -172,6 +173,9 @@ class FeatureConstructor:
                 'variance': variance,
                 'controllability': 0.0,
                 'variance_threshold': variance_threshold,
+                'normalized_variance': variance / max(variance_threshold, 1e-6)
+                if np.isfinite(variance)
+                else float('inf'),
                 'min_history': min_history,
                 'count': count,
                 'dropped': dropped,
@@ -189,8 +193,10 @@ class FeatureConstructor:
                 # Compute controllability heuristic
                 # Stable features (low variance) should have HIGH controllability
                 # Inverse relationship: 1 - normalized_variance
-                normalized_variance = min(variance / 0.5, 1.0)  # cap at 0.5
-                controllability = 1.0 - normalized_variance  # Stable = high controllability
+                normalized_variance = min(
+                    variance / max(variance_threshold, 1e-6), 1.0
+                ) if np.isfinite(variance) else 1.0
+                controllability = max(0.0, 1.0 - normalized_variance)
 
                 # Alternative: if bottleneck or high-value, boost controllability
                 if is_bottleneck or is_high_value:
@@ -312,7 +318,7 @@ class FeatureConstructor:
             action_scores = []
 
             for action in [0, 1]:  # LEFT, RIGHT
-                s_sim = state.copy()
+                s_sim = np.array(state, dtype=np.float32, copy=True)
                 cumulative_gvf = 0.0
                 discount = 1.0
 
@@ -322,7 +328,7 @@ class FeatureConstructor:
 
                     # Extract next state from tensor
                     if isinstance(s_next, torch.Tensor):
-                        s_next = s_next.squeeze().cpu().numpy()
+                        s_next = s_next.squeeze(0).cpu().numpy()
 
                     # GVF prediction at next state
                     gvf_value = gvf.predict(s_next)
@@ -343,28 +349,17 @@ class FeatureConstructor:
             # Contrast between actions
             if len(action_scores) == 2:
                 contrast = abs(action_scores[0] - action_scores[1])
-                mean_prediction = np.mean(np.abs(action_scores))
-                if np.isfinite(contrast) and np.isfinite(mean_prediction):
-                    contrasts.append((contrast, mean_prediction))
-
-        if not contrasts:
-            return 0.0
+                if np.isfinite(contrast):
+                    contrasts.append(np.clip(contrast, 0.0, 1.5))
 
         if not contrasts:
             return 0.0
 
         contrasts = np.array(contrasts, dtype=np.float64)
-
-        # Each tuple: (contrast, mean_prediction)
-        contrast_vals = contrasts[:, 0]
-        scale_vals = np.clip(contrasts[:, 1], a_min=1e-3, a_max=None)
-
-        # Relative contrast: how much one action changes prediction vs typical magnitude
-        relative = contrast_vals / scale_vals
-
-        # Smooth squashing keeps score in [0,1)
-        score = float(np.tanh(relative.mean()))
-        return max(0.0, min(1.0, score))
+        score = float(np.tanh(contrasts.mean()))
+        score = max(0.0, min(1.0, score))
+        self.controllability_log.append(score)
+        return score
 
 
 class SubtaskFormation:
@@ -523,6 +518,7 @@ class FCSTOMPManager:
         self.fc_stomp_history = []
         self.last_run_step = 0
         self.subtask_to_option = {}
+        self.feature_last_spawn_step = {}
 
     def run_fc_stomp_cycle(self, current_step, state_history=None, action_history=None):
         """
@@ -559,7 +555,9 @@ class FCSTOMPManager:
                 gvf = feature_info['gvf']
                 recent_states = list(state_history)[-500:]  # use last 500 states
                 controllability = self.feature_constructor.compute_model_based_controllability(
-                    gvf, recent_states, horizon=2
+                    gvf,
+                    recent_states,
+                    horizon=getattr(self.config, 'FC_CONTROLLABILITY_H', 2),
                 )
                 feature_info['controllability'] = controllability
             elif state_history and action_history:
@@ -582,7 +580,7 @@ class FCSTOMPManager:
                 results['subtasks_formed'] += 1
 
                 # S: ensure an option exists for this subtask
-                created = self._ensure_option_for_subtask(subtask)
+                created = self._ensure_option_for_subtask(subtask, current_step)
                 if created:
                     results['options_created'] += 1
 
@@ -604,10 +602,17 @@ class FCSTOMPManager:
 
         return results
 
-    def _ensure_option_for_subtask(self, subtask):
+    def _ensure_option_for_subtask(self, subtask, current_step):
         name = subtask['name']
         if name in self.subtask_to_option:
             return False
+
+        feature_name = subtask.get('feature_name')
+        cooldown = getattr(self.config, 'FC_FEATURE_SPAWN_COOLDOWN', 0)
+        if feature_name is not None:
+            last_spawn = self.feature_last_spawn_step.get(feature_name, -np.inf)
+            if current_step - last_spawn < cooldown:
+                return False
 
         if (
             self.option_library is None
@@ -638,6 +643,8 @@ class FCSTOMPManager:
             self.q_option.add_option()
 
         self.subtask_to_option[name] = option_id
+        if feature_name is not None:
+            self.feature_last_spawn_step[feature_name] = current_step
         return True
 
     def should_run(self, current_step):
