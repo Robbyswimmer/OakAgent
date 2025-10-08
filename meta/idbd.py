@@ -34,22 +34,46 @@ class IDBD:
         self.mu = mu
         self.min_alpha = min_alpha
         self.max_alpha = max_alpha
+        self.log_min_alpha = float(np.log(self.min_alpha))
+        self.log_max_alpha = float(np.log(self.max_alpha))
 
         # Initialize log step-sizes
         if init_log_alpha is None:
             init_log_alpha = np.log(1e-3)
-        self.log_alpha = np.ones(num_weights, dtype=np.float32) * init_log_alpha
+        self.log_alpha = np.ones(num_weights, dtype=np.float64) * init_log_alpha
 
         # Eligibility traces for meta-learning
-        self.h = np.zeros(num_weights, dtype=np.float32)
+        self.h = np.zeros(num_weights, dtype=np.float64)
 
         # Track previous gradients for meta-update
-        self.prev_grad = np.zeros(num_weights, dtype=np.float32)
+        self.prev_grad = np.zeros(num_weights, dtype=np.float64)
 
     def get_step_sizes(self):
         """Get current step-sizes (alpha = exp(log_alpha))"""
-        alpha = np.exp(self.log_alpha)
+        log_alpha_safe = np.clip(self.log_alpha, self.log_min_alpha, self.log_max_alpha)
+        alpha = np.exp(log_alpha_safe)
         return np.clip(alpha, self.min_alpha, self.max_alpha)
+
+    def _ensure_float64(self):
+        """Promote internal state to float64 once for numerical stability."""
+        if self.log_alpha.dtype != np.float64:
+            self.log_alpha = self.log_alpha.astype(np.float64)
+        if self.h.dtype != np.float64:
+            self.h = self.h.astype(np.float64)
+        if self.prev_grad.dtype != np.float64:
+            self.prev_grad = self.prev_grad.astype(np.float64)
+
+    def _apply_meta_update(self, delta):
+        """Apply bounded meta-update in log-space with anti-windup."""
+        self._ensure_float64()
+        delta = np.asarray(delta, dtype=np.float64)
+        g = np.clip(delta * self.h, -1.0, 1.0)
+        self.log_alpha += self.mu * g
+
+        if np.mean(self.log_alpha >= self.log_max_alpha - 1e-6) > 0.5:
+            self.log_alpha -= 0.01
+
+        self.log_alpha = np.clip(self.log_alpha, self.log_min_alpha, self.log_max_alpha)
 
     def update(self, gradient, features, td_error=None):
         """
@@ -63,6 +87,11 @@ class IDBD:
         Returns:
             updated step-sizes
         """
+        gradient = np.asarray(gradient, dtype=np.float64)
+        features = np.asarray(features, dtype=np.float64)
+
+        self._ensure_float64()
+
         # Update eligibility trace: h = h + features * gradient
         self.h = self.h + features * gradient
 
@@ -71,8 +100,7 @@ class IDBD:
         delta = td_error if td_error is not None else gradient
 
         # IDBD update
-        meta_gradient = self.mu * delta * self.h
-        self.log_alpha += meta_gradient
+        self._apply_meta_update(delta)
 
         # Decay eligibility traces
         self.h *= 0.99
@@ -94,6 +122,11 @@ class TIDBD(IDBD):
 
     def update(self, gradient, features, td_error=None):
         """Update using time-difference of gradients"""
+        gradient = np.asarray(gradient, dtype=np.float64)
+        features = np.asarray(features, dtype=np.float64)
+
+        self._ensure_float64()
+
         # Compute gradient difference
         grad_diff = gradient - self.prev_grad
 
@@ -102,8 +135,7 @@ class TIDBD(IDBD):
 
         # Meta-gradient using TD of gradients
         delta = td_error if td_error is not None else grad_diff
-        meta_gradient = self.mu * delta * self.h
-        self.log_alpha += meta_gradient
+        self._apply_meta_update(delta)
 
         # Decay
         self.h *= 0.99
@@ -122,6 +154,11 @@ class Autostep(IDBD):
 
     def update(self, gradient, features, td_error=None):
         """Update with normalization and bounds"""
+        gradient = np.asarray(gradient, dtype=np.float64)
+        features = np.asarray(features, dtype=np.float64)
+
+        self._ensure_float64()
+
         # Normalize features
         feature_norm = np.linalg.norm(features) + 1e-8
         normalized_features = features / feature_norm
@@ -131,12 +168,7 @@ class Autostep(IDBD):
 
         # Meta-gradient with TD error
         delta = td_error if td_error is not None else gradient
-        meta_gradient = self.mu * delta * self.h
-
-        # Clip meta-gradient for stability
-        meta_gradient = np.clip(meta_gradient, -1.0, 1.0)
-
-        self.log_alpha += meta_gradient
+        self._apply_meta_update(delta)
 
         # Decay
         self.h *= 0.99
@@ -200,13 +232,13 @@ class TorchIDBD(nn.Module):
 
         flat_grad = np.concatenate(
             [g.detach().cpu().numpy().reshape(-1) for g in usable_grads]
-        )
+        ).astype(np.float64)
 
         if isinstance(features, torch.Tensor):
             features = features.detach().cpu().numpy()
 
         if np.isscalar(features):
-            features = np.array([features], dtype=np.float32)
+            features = np.array([features], dtype=np.float64)
 
         if features.ndim == 0:
             features = features.reshape(1)
@@ -218,7 +250,7 @@ class TorchIDBD(nn.Module):
 
         feature_vector = np.tile(features, len(flat_grad) // len(features) + 1)[
             : len(flat_grad)
-        ]
+        ].astype(np.float64)
 
         step_sizes = self.idbd.update(flat_grad, feature_vector, td_error)
 
@@ -226,7 +258,7 @@ class TorchIDBD(nn.Module):
         start = 0
         for size, shape in zip(self.param_sizes, self.param_shapes):
             param_step_sizes = step_sizes[start : start + size].reshape(shape)
-            step_sizes_list.append(torch.tensor(param_step_sizes))
+            step_sizes_list.append(torch.tensor(param_step_sizes, dtype=torch.float32))
             start += size
 
         return step_sizes_list

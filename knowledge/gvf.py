@@ -33,6 +33,14 @@ class GVF(nn.Module):
             nn.Linear(hidden_size, 1)
         )
 
+        # Initialize with SMALL weights for normalized cumulants [0,1]
+        # Default init gives predictions ~500-1000, but we want ~0-5
+        for module in self.net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
         # Eligibility traces for TD(lambda)
         self.traces = {name: torch.zeros_like(param)
                       for name, param in self.net.named_parameters()}
@@ -53,7 +61,13 @@ class GVF(nn.Module):
         with torch.no_grad():
             prediction = self.net(state).squeeze()
 
-        return prediction.item() if prediction.dim() == 0 else prediction.cpu().numpy()
+        result = prediction.item() if prediction.dim() == 0 else prediction.cpu().numpy()
+
+        # Return 0.0 if prediction is invalid (shouldn't happen with safeguards, but just in case)
+        if not np.isfinite(result).all() if isinstance(result, np.ndarray) else not np.isfinite(result):
+            return 0.0
+
+        return result
 
     def forward(self, state):
         """Forward pass (for training)"""
@@ -99,26 +113,60 @@ class GVF(nn.Module):
         self.net.zero_grad()
         loss.backward()
 
+        # Clip gradients for stability
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+
         # Apply gradient (with optional custom step-size from IDBD)
         if step_size is not None:
+            # Bound step-size to prevent explosion
+            step_size = np.clip(step_size, 1e-6, 0.1)
             with torch.no_grad():
                 for param in self.net.parameters():
                     if param.grad is not None:
                         param.data -= step_size * param.grad
+                        # Clamp weights to prevent overflow
+                        param.data.clamp_(-10.0, 10.0)
         else:
             # Use default optimizer
             with torch.no_grad():
                 for param in self.net.parameters():
                     if param.grad is not None:
                         param.data -= 0.001 * param.grad
+                        # Clamp weights to prevent overflow
+                        param.data.clamp_(-10.0, 10.0)
+
+        # Check for NaN and reset if necessary
+        has_nan = False
+        with torch.no_grad():
+            for param in self.net.parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    has_nan = True
+                    break
+
+        if has_nan:
+            # Reset network weights
+            self._reset_weights()
+            return 0.0
 
         # Track error
-        self.error_history.append(abs(td_error.item()))
+        td_error_val = td_error.item()
+        if np.isfinite(td_error_val):
+            self.error_history.append(abs(td_error_val))
 
         # Store prediction
-        self.prediction_history.append(v_s.item())
+        v_s_val = v_s.item()
+        if np.isfinite(v_s_val):
+            self.prediction_history.append(v_s_val)
 
-        return td_error.item()
+        return td_error_val
+
+    def _reset_weights(self):
+        """Reset network weights to small random values"""
+        for module in self.net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def get_recent_predictions(self, n=100):
         """Get last n predictions for feature mining"""
@@ -138,14 +186,15 @@ class UprignessGVF(GVF):
     def __init__(self, state_dim, hidden_size=64, gamma=0.97):
         super().__init__(state_dim, hidden_size, gamma)
         self.name = "uprightness"
+        self.theta_max = 0.2095  # ~12 degrees (CartPole termination threshold)
 
     def compute_cumulant(self, state):
-        """Cumulant: |theta|"""
+        """Cumulant: normalized |theta| ∈ [0, 1]"""
         if isinstance(state, np.ndarray):
             theta = state[2]  # theta is 3rd component
         else:
             theta = state[..., 2]
-        return abs(theta)
+        return abs(theta) / self.theta_max
 
 
 class CenteringGVF(GVF):
@@ -154,14 +203,15 @@ class CenteringGVF(GVF):
     def __init__(self, state_dim, hidden_size=64, gamma=0.97):
         super().__init__(state_dim, hidden_size, gamma)
         self.name = "centering"
+        self.x_max = 2.4  # CartPole termination threshold
 
     def compute_cumulant(self, state):
-        """Cumulant: |x|"""
+        """Cumulant: normalized |x| ∈ [0, 1]"""
         if isinstance(state, np.ndarray):
             x = state[0]  # x is 1st component
         else:
             x = state[..., 0]
-        return abs(x)
+        return abs(x) / self.x_max
 
 
 class StabilityGVF(GVF):
@@ -170,16 +220,18 @@ class StabilityGVF(GVF):
     def __init__(self, state_dim, hidden_size=64, gamma=0.97):
         super().__init__(state_dim, hidden_size, gamma)
         self.name = "stability"
+        self.velocity_scale = 5.0  # Empirical max for |theta_dot| + |x_dot|
 
     def compute_cumulant(self, state):
-        """Cumulant: |theta_dot| + |x_dot|"""
+        """Cumulant: normalized velocity magnitude ∈ [0, 1]"""
         if isinstance(state, np.ndarray):
             x_dot = state[1]
             theta_dot = state[3]
         else:
             x_dot = state[..., 1]
             theta_dot = state[..., 3]
-        return abs(theta_dot) + abs(x_dot)
+        total_velocity = abs(theta_dot) + abs(x_dot)
+        return min(total_velocity / self.velocity_scale, 1.0)
 
 
 class SurvivalGVF(GVF):

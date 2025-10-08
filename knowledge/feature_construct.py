@@ -14,6 +14,9 @@ P: Planning & Acting - use in decision-making
 import math
 from collections import deque
 
+import numpy as np
+import torch
+
 
 def _safe_mean(values):
     """Return the arithmetic mean, handling empty sequences."""
@@ -72,9 +75,10 @@ class FeatureConstructor:
     Identifies promising features for option creation
     """
 
-    def __init__(self, horde_gvfs, config):
+    def __init__(self, horde_gvfs, config, dyn_model=None):
         self.horde = horde_gvfs
         self.config = config
+        self.dyn_model = dyn_model
 
         # Track discovered features
         self.discovered_features = []
@@ -82,34 +86,104 @@ class FeatureConstructor:
         # History for analysis
         self.feature_history = deque(maxlen=1000)
 
-    def mine_features(self):
+    def mine_features(self, state_history=None, current_step=0):
         """
         Mine GVF prediction histories for promising features
 
         Returns:
-            list of (feature_name, feature_fn, controllability_score)
+            tuple(promising_features, feature_stats)
         """
         promising_features = []
+        feature_stats = []
 
-        # Get prediction histories from all GVFs
-        histories = self.horde.get_prediction_histories()
+        # Prefer on-the-fly predictions from recent states if available
+        invalid_counts = {}
+        history_sample_size = 0
+
+        if state_history:
+            recent_states = list(state_history)[-self.config.GVF_BUFFER_SIZE :]
+            history_sample_size = len(recent_states)
+            histories = {}
+            for gvf_name, gvf in self.horde.gvfs.items():
+                preds = []
+                invalid_count = 0
+                for state in recent_states:
+                    if state is None:
+                        invalid_count += 1
+                        continue
+                    if isinstance(state, np.ndarray) and not np.all(np.isfinite(state)):
+                        invalid_count += 1
+                        continue
+                    value = gvf.predict(state)
+
+                    # DEBUG: Log first few predictions at FC-STOMP time
+                    if len(preds) < 3:
+                        cumulant = gvf.compute_cumulant(state)
+                        print(f"  [FC-STOMP {gvf_name}] pred={value:.2f}, cumulant={cumulant:.3f}")
+
+                    if not np.isfinite(value):
+                        invalid_count += 1
+                        continue
+                    preds.append(value)
+                histories[gvf_name] = preds
+                invalid_counts[gvf_name] = invalid_count
+        else:
+            histories = self.horde.get_prediction_histories()
+
+        if not histories:
+            histories = self.horde.get_prediction_histories()
 
         for gvf_name, predictions in histories.items():
-            if len(predictions) < 100:
-                continue
+            if not predictions:
+                fallback_predictions = self.horde.get_prediction_histories().get(
+                    gvf_name, []
+                )
+                if fallback_predictions:
+                    predictions = fallback_predictions
+                    histories[gvf_name] = predictions
+
+            min_history = getattr(self.config, 'FC_HISTORY_MIN_LENGTH', 100)
+            snapshot_idx = len(feature_stats)
 
             # Criteria for promising features:
-
-            # 1. Low variance (stable prediction)
-            variance = _safe_variance(predictions)
-            is_stable = variance < self.config.FC_FEATURE_VARIANCE_THRESHOLD
+            count = len(predictions)
+            variance = _safe_variance(predictions) if count > 0 else float('nan')
+            variance_threshold = self.config.FC_FEATURE_VARIANCE_THRESHOLD
+            relaxed_threshold = getattr(
+                self.config, 'FC_FEATURE_INITIAL_VARIANCE', variance_threshold
+            )
+            relax_steps = getattr(self.config, 'FC_FEATURE_RELAX_STEPS', 0)
+            if current_step < relax_steps:
+                variance_threshold = max(variance_threshold, relaxed_threshold)
+            is_stable = variance < variance_threshold
 
             # 2. Bottleneck detection (low values that can be controlled)
-            mean_value = _safe_mean(predictions)
-            is_bottleneck = mean_value < 0.5  # threshold for "small" values
+            mean_value = _safe_mean(predictions) if count > 0 else float('nan')
+            is_bottleneck = mean_value < 0.3  # threshold for "small" values (normalized GVFs)
 
             # 3. High-value survival predictions
             is_high_value = gvf_name == 'survival' and mean_value > 100
+
+            dropped = invalid_counts.get(gvf_name, 0)
+
+            feature_snapshot = {
+                'name': gvf_name,
+                'mean': mean_value,
+                'variance': variance,
+                'controllability': 0.0,
+                'variance_threshold': variance_threshold,
+                'min_history': min_history,
+                'count': count,
+                'dropped': dropped,
+                'history_size': history_sample_size,
+            }
+            if history_sample_size > 0 and dropped >= history_sample_size:
+                feature_snapshot['note'] = 'all_recent_states_invalid'
+            feature_stats.append(feature_snapshot)
+            self.feature_history.append(feature_snapshot)
+
+            if count < min_history:
+                continue
 
             if is_stable or is_bottleneck or is_high_value:
                 # Compute controllability heuristic
@@ -129,43 +203,153 @@ class FeatureConstructor:
                     'variance': variance,
                     'controllability': controllability,
                     'stable': is_stable,
-                    'bottleneck': is_bottleneck
+                    'bottleneck': is_bottleneck,
+                    'stats_index': snapshot_idx,
                 }
 
+                feature_snapshot['controllability'] = controllability
                 promising_features.append(feature_info)
 
-        return promising_features
+        return promising_features, feature_stats
 
     def analyze_feature_controllability(self, feature_name, state_history, action_history):
-        """
-        Analyze whether a feature can be controlled by actions
-        Computes correlation between actions and feature changes
-        """
+        """Estimate how strongly actions influence a GVF feature."""
         if len(state_history) < 50:
             return 0.0
 
-        # Get feature values from states
-        feature_values = []
         gvf = self.horde[feature_name]
 
-        for state in state_history:
-            value = gvf.predict(state)
-            feature_values.append(value)
-
-        # Compute correlation with actions (simple measure)
-        if len(action_history) < len(feature_values):
-            action_history = action_history + [0] * (len(feature_values) - len(action_history))
-
-        # Measure how much feature changes when actions change
-        feature_diffs = _diff(feature_values[:len(action_history) - 1])
-        action_changes = _diff(action_history[:len(feature_values) - 1])
-
-        if len(feature_diffs) == 0 or _safe_std(action_changes) == 0:
+        feature_values = np.array(
+            [gvf.predict(state) for state in state_history], dtype=np.float64
+        )
+        if feature_values.size < 2 or not np.isfinite(feature_values).all():
             return 0.0
 
-        # Correlation
-        correlation = abs(_correlation(feature_diffs, action_changes))
-        return correlation if not math.isnan(correlation) else 0.0
+        actions = np.array(action_history[: len(feature_values)], dtype=np.float64)
+        if actions.size < 2:
+            return 0.0
+
+        # Align transitions so each action corresponds to change in the feature
+        feature_curr = feature_values[:-1]
+        feature_next = feature_values[1:]
+        actions_curr = actions[:-1]
+
+        if feature_name == 'survival':
+            delta = feature_next - feature_curr  # want to grow survival horizon
+        else:
+            delta = feature_curr - feature_next  # want to reduce magnitude
+
+        valid_mask = np.isfinite(delta)
+        delta = delta[valid_mask]
+        actions_curr = actions_curr[valid_mask]
+
+        if delta.size < 20:
+            return 0.0
+
+        action_effects = []
+        for action in np.unique(actions_curr):
+            mask = actions_curr == action
+            count = int(np.sum(mask))
+            if count < 5:
+                continue
+            mean_delta = float(np.mean(delta[mask]))
+            action_effects.append((count, mean_delta))
+
+        if not action_effects:
+            return 0.0
+
+        counts = np.array([c for c, _ in action_effects], dtype=np.float64)
+        effects = np.array([e for _, e in action_effects], dtype=np.float64)
+
+        best_effect = float(np.max(effects))
+        worst_effect = float(np.min(effects)) if effects.size > 1 else 0.0
+        contrast = max(0.0, best_effect - worst_effect)
+        progress = max(0.0, best_effect) + 0.5 * contrast
+
+        if progress <= 0.0:
+            return 0.0
+
+        coverage = float(np.clip(np.mean(counts) / max(len(feature_curr), 1), 0.05, 1.0))
+        feature_scale = float(np.std(feature_curr) + np.std(delta) + 1e-6)
+
+        score = (progress * coverage) / feature_scale
+        score = float(np.tanh(2.5 * score))  # squash to [0, 1)
+        return max(0.0, min(1.0, score))
+
+    def compute_model_based_controllability(self, gvf, recent_states, horizon=2):
+        """
+        Model-based controllability via action contrast lookahead.
+
+        For each state, simulate both actions (LEFT=0, RIGHT=1) for H steps,
+        measure cumulative GVF predictions, compute contrast.
+
+        Args:
+            gvf: GVF to evaluate
+            recent_states: list of recent states to sample from
+            horizon: lookahead steps (default 2-3 is good)
+
+        Returns:
+            float: mean action contrast Δ ∈ [0, 1+]
+        """
+        if self.dyn_model is None or not recent_states:
+            return 0.0
+
+        # Sample up to 50 states for efficiency
+        n_samples = min(50, len(recent_states))
+        if n_samples < 10:
+            return 0.0
+
+        sample_indices = np.random.choice(len(recent_states), n_samples, replace=False)
+        sampled_states = [recent_states[i] for i in sample_indices]
+
+        contrasts = []
+
+        for state in sampled_states:
+            if state is None or not np.all(np.isfinite(state)):
+                continue
+
+            # Simulate both actions
+            action_scores = []
+
+            for action in [0, 1]:  # LEFT, RIGHT
+                s_sim = state.copy()
+                cumulative_gvf = 0.0
+                discount = 1.0
+
+                for h in range(horizon):
+                    # One-step model prediction
+                    s_next, r_pred = self.dyn_model.predict(s_sim, action)
+
+                    # Extract next state from tensor
+                    if isinstance(s_next, torch.Tensor):
+                        s_next = s_next.squeeze().cpu().numpy()
+
+                    # GVF prediction at next state
+                    gvf_value = gvf.predict(s_next)
+
+                    if not np.isfinite(gvf_value):
+                        break
+
+                    cumulative_gvf += discount * gvf_value
+                    discount *= 0.9  # decay for multi-step
+                    s_sim = s_next
+
+                    # Early stop if terminal-looking state
+                    if abs(s_sim[0]) > 2.4 or abs(s_sim[2]) > 0.2095:
+                        break
+
+                action_scores.append(cumulative_gvf)
+
+            # Contrast between actions
+            if len(action_scores) == 2:
+                contrast = abs(action_scores[0] - action_scores[1])
+                if np.isfinite(contrast):
+                    contrasts.append(contrast)
+
+        if not contrasts:
+            return 0.0
+
+        return float(np.mean(contrasts))
 
 
 class SubtaskFormation:
@@ -307,15 +491,16 @@ class FCSTOMPManager:
     """
 
     def __init__(self, horde_gvfs, option_library, option_models,
-                 q_option, config):
+                 q_option, config, dyn_model=None):
         self.horde = horde_gvfs
         self.option_library = option_library
         self.option_models = option_models
         self.q_option = q_option
         self.config = config
+        self.dyn_model = dyn_model
 
         # Sub-components
-        self.feature_constructor = FeatureConstructor(horde_gvfs, config)
+        self.feature_constructor = FeatureConstructor(horde_gvfs, config, dyn_model)
         self.subtask_former = SubtaskFormation(config)
         self.pruner = OptionPruner(option_library, config)
 
@@ -341,21 +526,40 @@ class FCSTOMPManager:
             'features_mined': 0,
             'subtasks_formed': 0,
             'options_created': 0,
-            'options_pruned': 0
+            'options_pruned': 0,
+            'feature_stats': []
         }
 
         # F: Feature Construction
-        promising_features = self.feature_constructor.mine_features()
+        promising_features, feature_stats = self.feature_constructor.mine_features(
+            state_history, current_step=current_step
+        )
         results['features_mined'] = len(promising_features)
+        results['feature_stats'] = feature_stats
 
         # C: Subtask Formation
         for feature_info in promising_features:
-            # Check controllability if history available
-            if state_history and action_history:
+            # Check controllability using model-based lookahead if available
+            if state_history and self.dyn_model is not None:
+                gvf = feature_info['gvf']
+                recent_states = list(state_history)[-500:]  # use last 500 states
+                controllability = self.feature_constructor.compute_model_based_controllability(
+                    gvf, recent_states, horizon=2
+                )
+                feature_info['controllability'] = controllability
+            elif state_history and action_history:
+                # Fallback to historical correlation method
                 controllability = self.feature_constructor.analyze_feature_controllability(
                     feature_info['name'], state_history, action_history
                 )
                 feature_info['controllability'] = controllability
+
+            stats_idx = feature_info.get('stats_index')
+            if stats_idx is not None and 0 <= stats_idx < len(results['feature_stats']):
+                results['feature_stats'][stats_idx]['controllability'] = feature_info.get(
+                    'controllability', 0.0
+                )
+            feature_info.pop('stats_index', None)
 
             # Only create subtask if controllable enough
             if feature_info['controllability'] >= self.config.FC_MIN_CONTROLLABILITY:

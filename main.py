@@ -117,7 +117,8 @@ class OaKAgent:
             self.option_library,
             self.option_models,
             self.q_option,
-            config
+            config,
+            self.dyn_model
         )
 
         # Register option models for all options
@@ -221,7 +222,30 @@ class OaKAgent:
                         list(self.state_history),
                         list(self.action_history)
                     )
-                    print(f"  FC-STOMP: {fc_results}")
+                    # Enhanced FC-STOMP logging
+                    print(f"  FC-STOMP @ step {fc_results['step']}:")
+                    print(f"    Mined={fc_results['features_mined']}, Subtasks={fc_results['subtasks_formed']}, Created={fc_results['options_created']}, Pruned={fc_results['options_pruned']}")
+
+                    # Log controllability scores per GVF
+                    if fc_results.get('feature_stats'):
+                        ctrl_scores = {fs['name']: f"{fs.get('controllability', 0.0):.3f}"
+                                      for fs in fc_results['feature_stats']}
+                        print(f"    Controllability: {ctrl_scores}")
+
+                        gvf_means = {fs['name']: f"{fs.get('mean', 0.0):.2f}"
+                                    for fs in fc_results['feature_stats']}
+                        print(f"    GVF Means: {gvf_means}")
+
+                    # Log option usage stats
+                    option_stats_list = []
+                    for opt_id in range(self.option_library.get_num_options()):
+                        stats = self.option_library.get_option(opt_id).get_statistics()
+                        if stats['executions'] > 0:
+                            option_stats_list.append(
+                                f"{opt_id}:{stats['executions']}x/{stats['avg_duration']:.1f}s/{stats['success_rate']*100:.0f}%"
+                            )
+                    if option_stats_list:
+                        print(f"    Options: [{', '.join(option_stats_list)}]")
 
                 self.total_steps += 1
 
@@ -384,4 +408,35 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='OaK-CartPole: Options and Knowledge Agent')
+    parser.add_argument('--num-episodes', type=int, default=None,
+                        help='Number of training episodes (overrides config)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (overrides config)')
+    parser.add_argument('--ablation', type=str, default=None,
+                        choices=['no_planning', 'no_options', 'no_gvfs', 'no_idbd'],
+                        help='Run specific ablation study')
+    parser.add_argument('--output-suffix', type=str, default='',
+                        help='Suffix to add to output filenames')
+
+    args = parser.parse_args()
+
+    # Override config if arguments provided
+    if args.num_episodes is not None:
+        Config.NUM_EPISODES = args.num_episodes
+    if args.seed is not None:
+        Config.SEED = args.seed
+
+    # Set ablation flags
+    if args.ablation == 'no_planning':
+        Config.ABLATION_NO_PLANNING = True
+    elif args.ablation == 'no_options':
+        Config.ABLATION_NO_OPTIONS = True
+    elif args.ablation == 'no_gvfs':
+        Config.ABLATION_NO_GVFS = True
+    elif args.ablation == 'no_idbd':
+        Config.ABLATION_NO_IDBD = True
+
     main()

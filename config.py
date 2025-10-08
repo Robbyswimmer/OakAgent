@@ -12,7 +12,7 @@ class Config:
     DYN_HIDDEN_SIZE = 128
     DYN_NUM_LAYERS = 2
     DYN_ENSEMBLE_SIZE = 3
-    DYN_TRAIN_STEPS = 10  # M1: minibatches per env step
+    DYN_TRAIN_STEPS = 20  # M1: minibatches per env step
     DYN_BATCH_SIZE = 256
     DYN_LAMBDA_R = 1.0  # reward loss weight
 
@@ -31,7 +31,7 @@ class Config:
     GVF_HIDDEN_SIZE = 64
     GVF_GAMMA_SHORT = 0.97  # for g1, g2, g3
     GVF_GAMMA_LONG = 0.999  # for g4 (survival)
-    GVF_TRAIN_STEPS = 10  # M3
+    GVF_TRAIN_STEPS = 15  # M3
     GVF_BUFFER_SIZE = 1000  # ring buffer for feature mining
 
     # Options
@@ -41,13 +41,13 @@ class Config:
     OPTION_VELOCITY_THRESHOLD = 0.5  # for stability
     OPTION_POLICY_HIDDEN = 64
     OPTION_MODEL_MIN_ROLLOUTS = 5
-    OPTION_MODEL_ERROR_THRESHOLD = 1.0
+    OPTION_MODEL_ERROR_THRESHOLD = 1.5
 
     # Planner (Dyna)
     PLANNER_TYPE = "dyna"  # or "mpc"
-    DYNA_PLAN_STEPS = 20  # M_plan
-    DYNA_HORIZON = 5  # H
-    DYNA_NUM_RECENT_STATES = 50  # B: recent states to sample from
+    DYNA_PLAN_STEPS = 60  # M_plan
+    DYNA_HORIZON = 11  # H
+    DYNA_NUM_RECENT_STATES = 100  # B: recent states to sample from
 
     # MPC (alternative planner)
     MPC_NUM_SEQUENCES = 100  # N
@@ -55,17 +55,20 @@ class Config:
 
     # Meta-Learning (IDBD/TIDBD/Autostep)
     META_TYPE = "idbd"  # "idbd", "tidbd", or "autostep"
-    META_MU = 1e-3  # meta learning rate
+    META_MU = 3e-4  # meta learning rate
     META_INIT_LOG_ALPHA = math.log(1e-3)  # initial step-size
     META_MIN_ALPHA = 1e-6
-    META_MAX_ALPHA = 1.0
+    META_MAX_ALPHA = 0.1
 
-    # FC-STOMP
-    FC_STOMP_FREQ = 1000  # T_FC: env steps between feature construction
-    FC_FEATURE_VARIANCE_THRESHOLD = 0.1  # for stable features
-    FC_MIN_CONTROLLABILITY = 0.3  # min correlation with actions
+    # FC-STOMP (post-normalization thresholds for GVF values ∈ [0,1])
+    FC_STOMP_FREQ = 500  # T_FC: env steps between feature construction
+    FC_FEATURE_VARIANCE_THRESHOLD = 0.12  # for stable features (normalized)
+    FC_FEATURE_INITIAL_VARIANCE = 0.12  # relaxed threshold early in training
+    FC_FEATURE_RELAX_STEPS = 800  # steps to use relaxed threshold
+    FC_HISTORY_MIN_LENGTH = 20  # minimum samples before evaluating feature
+    FC_MIN_CONTROLLABILITY = 0.25  # min action contrast via model lookahead
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
-    FC_OPTION_SUCCESS_THRESHOLD = 0.2  # min success rate to keep option
+    FC_OPTION_SUCCESS_THRESHOLD = 0.10  # min success rate to keep option
     FC_SURVIVAL_TARGET = 200.0
 
     # Replay Buffers
