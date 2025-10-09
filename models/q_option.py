@@ -63,8 +63,8 @@ class SMDPQNetwork:
         self.gamma = gamma
         self.base_lr = lr
 
-        # Q-network
-        self.q_net = OptionQNetwork(state_dim, num_options)
+        # Q-network (may be None until first option exists)
+        self.q_net = None
 
         self.meta_config = meta_config or {}
         self.use_meta = meta_config is not None and not self.meta_config.get(
@@ -72,34 +72,43 @@ class SMDPQNetwork:
         )
         self.meta_updater = None
         self.optimizer = None
-        if self.use_meta:
-            self.meta_updater = TorchIDBD(
-                self.q_net.parameters(),
-                mu=self.meta_config.get("mu", 1e-3),
-                init_log_alpha=self.meta_config.get("init_log_alpha", np.log(lr)),
-                meta_type=self.meta_config.get("type", "idbd"),
-                min_alpha=self.meta_config.get("min_alpha", 1e-6),
-                max_alpha=self.meta_config.get("max_alpha", 1.0),
-            )
-        else:
-            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        if num_options > 0:
+            self._initialize_network(num_options)
 
         # Tracking
         self.td_errors = []
         self.option_counts = {i: 0 for i in range(num_options)}
 
+    def _initialize_network(self, num_options):
+        """Create Q-network and optimizer/meta-learner for current option count."""
+        self.q_net = OptionQNetwork(self.state_dim, num_options)
+        if self.use_meta:
+            self._reinit_meta()
+            self.optimizer = None
+        else:
+            self.meta_updater = None
+            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.base_lr)
+
     def predict(self, state):
         """Get Q-values for all options at state"""
+        if self.q_net is None or self.num_options == 0:
+            return np.zeros(0, dtype=np.float32)
+
         with torch.no_grad():
             return self.q_net(state).cpu().numpy()
 
     def select_option(self, state, epsilon=0.0):
         """Epsilon-greedy option selection"""
+        if self.num_options == 0 or self.q_net is None:
+            return None
+
         if np.random.rand() < epsilon:
             return np.random.randint(self.num_options)
 
         q_values = self.predict(state)
-        return np.argmax(q_values)
+        if q_values.size == 0:
+            return None
+        return int(np.argmax(q_values))
 
     def update_smdp(self, s_start, option_id, R_total, s_end, duration, done=False):
         """
@@ -116,6 +125,9 @@ class SMDPQNetwork:
         Returns:
             loss value
         """
+        if self.q_net is None or self.num_options == 0:
+            return 0.0
+
         # Convert to tensors
         if isinstance(s_start, np.ndarray):
             s_start = torch.FloatTensor(s_start)
@@ -198,49 +210,67 @@ class SMDPQNetwork:
         return np.mean(recent_errors)
 
     def _reinit_meta(self):
-        if self.use_meta:
-            self.meta_updater = TorchIDBD(
-                self.q_net.parameters(),
-                mu=self.meta_config.get("mu", 1e-3),
-                init_log_alpha=self.meta_config.get("init_log_alpha", np.log(self.base_lr)),
-                meta_type=self.meta_config.get("type", "idbd"),
-                min_alpha=self.meta_config.get("min_alpha", 1e-6),
-                max_alpha=self.meta_config.get("max_alpha", 1.0),
-            )
+        if not self.use_meta or self.q_net is None:
+            return
+
+        self.meta_updater = TorchIDBD(
+            self.q_net.parameters(),
+            mu=self.meta_config.get("mu", 1e-3),
+            init_log_alpha=self.meta_config.get("init_log_alpha", np.log(self.base_lr)),
+            meta_type=self.meta_config.get("type", "idbd"),
+            min_alpha=self.meta_config.get("min_alpha", 1e-6),
+            max_alpha=self.meta_config.get("max_alpha", 1.0),
+        )
 
     def add_option(self):
         """Dynamically add a new option (for FC-STOMP)"""
         old_num = self.num_options
         self.num_options += 1
 
-        old_state = self.q_net.state_dict()
-        new_net = OptionQNetwork(self.state_dim, self.num_options)
-        new_state = new_net.state_dict()
-
-        # Copy shared layers
-        for name, param in old_state.items():
-            if name not in new_state:
-                continue
-            if name.endswith("weight") and new_state[name].shape[0] == self.num_options and param.shape[0] == old_num:
-                new_state[name][:old_num] = param
-            elif name.endswith("bias") and new_state[name].shape[0] == self.num_options and param.shape[0] == old_num:
-                new_state[name][:old_num] = param
-            elif new_state[name].shape == param.shape:
-                new_state[name] = param
-
-        new_net.load_state_dict(new_state)
-        self.q_net = new_net
-
-        if self.use_meta:
-            self._reinit_meta()
+        if old_num == 0 or self.q_net is None:
+            # First option – just initialize new network
+            self._initialize_network(self.num_options)
         else:
-            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.base_lr)
+            old_state = self.q_net.state_dict()
+            new_net = OptionQNetwork(self.state_dim, self.num_options)
+            new_state = new_net.state_dict()
+
+            # Copy shared layers
+            for name, param in old_state.items():
+                if name not in new_state:
+                    continue
+                if (
+                    name.endswith("weight")
+                    and new_state[name].shape[0] == self.num_options
+                    and param.shape[0] == old_num
+                ):
+                    new_state[name][:old_num] = param
+                elif (
+                    name.endswith("bias")
+                    and new_state[name].shape[0] == self.num_options
+                    and param.shape[0] == old_num
+                ):
+                    new_state[name][:old_num] = param
+                elif new_state[name].shape == param.shape:
+                    new_state[name] = param
+
+            new_net.load_state_dict(new_state)
+            self.q_net = new_net
+
+            if self.use_meta:
+                self._reinit_meta()
+                self.optimizer = None
+            else:
+                self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.base_lr)
 
         self.option_counts[self.num_options - 1] = 0
 
     def reset_option(self, option_id):
         """Reinitialize an existing option head without changing network size."""
         if option_id < 0 or option_id >= self.num_options:
+            return
+
+        if self.q_net is None:
             return
 
         last_layer = None

@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from meta.meta_optimizer import MetaOptimizerAdapter
+
 class OptionPolicy(nn.Module):
     """Internal policy for an option"""
 
@@ -62,7 +64,6 @@ class Option:
 
         # Internal policy
         self.policy = OptionPolicy(state_dim, action_dim, hidden_size)
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
         # Execution tracking
         self.execution_count = 0
@@ -75,7 +76,10 @@ class Option:
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
-        self.value_optimizer = torch.optim.Adam(self.value_net.parameters(), lr=lr)
+        self.policy_optimizer = None
+        self.value_optimizer = None
+        self.policy_lr = lr
+        self.value_lr = lr
 
     def initiation(self, state):
         """
@@ -103,6 +107,31 @@ class Option:
     def select_action(self, state):
         """Select action using option's internal policy"""
         return self.policy.select_action(state)
+
+    def configure_optimizers(
+        self,
+        policy_lr=None,
+        value_lr=None,
+        policy_meta_config=None,
+        value_meta_config=None,
+    ):
+        """Attach optimizers/meta-optimizers for the option."""
+        self.policy_lr = policy_lr if policy_lr is not None else self.policy_lr
+        self.value_lr = value_lr if value_lr is not None else self.value_lr
+        self.policy_optimizer = MetaOptimizerAdapter(
+            self.policy.parameters(),
+            base_lr=self.policy_lr,
+            meta_config=policy_meta_config,
+        )
+        self.value_optimizer = MetaOptimizerAdapter(
+            self.value_net.parameters(),
+            base_lr=self.value_lr,
+            meta_config=value_meta_config,
+        )
+
+    def _ensure_optimizers(self):
+        if self.policy_optimizer is None or self.value_optimizer is None:
+            self.configure_optimizers()
 
     def update_policy(self, trajectory, gamma=0.99):
         """
@@ -183,11 +212,16 @@ class Option:
                 loss = loss.mean()
 
             # Backward pass
-            self.optimizer.zero_grad()
+            self._ensure_optimizers()
+            self.policy_optimizer.zero_grad()
             self.value_optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
-            self.value_optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), max_norm=1.0)
+
+            feature_vec = state.detach().cpu().numpy().reshape(-1)
+            self.policy_optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
+            self.value_optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
 
             total_loss += loss.item()
 

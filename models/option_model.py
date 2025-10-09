@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from meta.meta_optimizer import MetaOptimizerAdapter
+
 class OptionModel(nn.Module):
     """
     SMDP model for a single option
@@ -79,12 +81,14 @@ class OptionModelLibrary:
         lr=1e-3,
         min_rollouts=5,
         error_threshold=None,
+        meta_config=None,
     ):
         self.state_dim = state_dim
         self.hidden_size = hidden_size
         self.lr = lr
         self.min_rollouts = min_rollouts
         self.error_threshold = error_threshold
+        self.meta_config = meta_config.copy() if meta_config is not None else None
 
         # Dictionary: option_id -> (model, optimizer)
         self.models = {}
@@ -94,7 +98,7 @@ class OptionModelLibrary:
     def add_option(self, option_id):
         """Add a new option model"""
         model = OptionModel(self.state_dim, self.hidden_size)
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        optimizer = MetaOptimizerAdapter(model.parameters(), base_lr=self.lr, meta_config=self.meta_config)
         self.models[option_id] = (model, optimizer)
         self.prediction_errors[option_id] = []
         self.experience_counts[option_id] = 0
@@ -163,7 +167,10 @@ class OptionModelLibrary:
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        feature_vec = s_start.detach().cpu().numpy().reshape(-1)
+        optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
 
         # Track error
         self.prediction_errors[option_id].append(loss.item())

@@ -486,8 +486,8 @@ class OptionPruner:
                 to_prune.append(option_id)
                 continue
 
-            # 2. Recent usage underperforms
-            if option_id >= 4:
+            # 2. Recent usage underperforms (skip protected options)
+            if not self.option_library.is_protected(option_id):
                 usage_stats = recent_usage.get(option_id)
                 if usage_stats:
                     if (
@@ -570,6 +570,15 @@ class FCSTOMPManager:
         results['feature_stats'] = feature_stats
 
         # C: Subtask Formation
+        optionless = not self.option_library.get_option_ids()
+        min_controllability = self.config.FC_MIN_CONTROLLABILITY
+        if optionless:
+            min_controllability = getattr(
+                self.config,
+                'FC_MIN_CONTROLLABILITY_BOOTSTRAP',
+                max(0.0, self.config.FC_MIN_CONTROLLABILITY * 0.5),
+            )
+
         for feature_info in promising_features:
             # Check controllability using model-based lookahead if available
             if state_history and self.dyn_model is not None:
@@ -595,8 +604,8 @@ class FCSTOMPManager:
                 )
             feature_info.pop('stats_index', None)
 
-            # Only create subtask if controllable enough
-            if feature_info['controllability'] >= self.config.FC_MIN_CONTROLLABILITY:
+            # Only create subtask if controllable enough (relaxed if no options yet)
+            if feature_info['controllability'] >= min_controllability:
                 subtask = self.subtask_former.create_subtask(feature_info)
                 results['subtasks_formed'] += 1
 
@@ -605,11 +614,14 @@ class FCSTOMPManager:
                 if created:
                     results['options_created'] += 1
 
+        if optionless and results['options_created'] == 0:
+            print("[FC-STOMP] Scouting phase: no controllable features yet; retrying later.")
+
         # Prune underperforming options
         options_to_prune = self.pruner.evaluate_options(recent_option_usage)
         for option_id in options_to_prune:
-            # Only prune if not a core option (keep 0-3)
-            if option_id >= 4:
+            # Only process options that are not protected by configuration.
+            if not self.option_library.is_protected(option_id):
                 if hasattr(self.option_models, 'remove_option'):
                     self.option_models.remove_option(option_id)
                 if hasattr(self.q_option, 'reset_option'):

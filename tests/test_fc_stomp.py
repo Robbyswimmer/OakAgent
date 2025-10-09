@@ -45,6 +45,12 @@ class DummyOptionLibrary:
     def remove_option(self, option_id):
         self.removed.append(option_id)
 
+    def is_protected(self, option_id):
+        return option_id < 4
+
+    def get_option_ids(self):
+        return [0, 4]
+
 
 @dataclass
 class DummyConfig:
@@ -55,6 +61,17 @@ class DummyConfig:
     OPTION_THETA_THRESHOLD: float = 0.05
     OPTION_X_THRESHOLD: float = 0.1
     OPTION_VELOCITY_THRESHOLD: float = 0.5
+    OPTION_POLICY_LR: float = 1e-3
+    OPTION_VALUE_LR: float = 1e-3
+    OPTION_POLICY_META_ENABLED: bool = False
+    OPTION_VALUE_META_ENABLED: bool = False
+    OPTION_MODEL_LR: float = 1e-3
+    OPTION_MODEL_META_ENABLED: bool = False
+    OPTION_PROTECTED_IDS = []
+    GVF_LR: float = 1e-3
+    GVF_META_ENABLED: bool = False
+    DYN_LR: float = 1e-3
+    DYN_META_ENABLED: bool = False
 
 
 @pytest.fixture

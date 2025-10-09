@@ -1,10 +1,10 @@
 """
-Option Library: 4 Core Options for CartPole
-Each option targets a specific GVF-derived feature:
-- o1/o2: Uprightness (reduce |theta|)
-- o3: Centering (reduce |x|)
-- o4: Stabilize (reduce velocities)
+Option Library: dynamic GVF-derived options for CartPole.
+The canonical upright/centering/stabilize option classes remain available for
+FC-STOMP or other discovery routines, but the library no longer seeds them by
+default—options emerge through the developmental loop.
 """
+import math
 import numpy as np
 from .option import Option
 
@@ -124,15 +124,16 @@ class OptionLibrary:
     Manages creation, execution, and lifecycle of options
     """
 
-    def __init__(self, state_dim, action_dim, config):
+    def __init__(self, state_dim, action_dim, config, meta_config=None):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.config = config
+        self.meta_template = meta_config.copy() if meta_config is not None else None
 
-        # Create initial 4 core options
+        # No pre-seeded options; FC-STOMP or other discovery mechanisms populate this.
         self.options = []  # index -> Option or None
         self.subtask_option_map = {}
-        self._create_core_options()
+        self.protected_options = set(getattr(self.config, 'OPTION_PROTECTED_IDS', []))
 
     def _create_core_options(self):
         """Create the 4 core GVF-derived options"""
@@ -184,6 +185,10 @@ class OptionLibrary:
             return self.options[option_id]
         return None
 
+    def is_protected(self, option_id):
+        """Return whether the option should be shielded from pruning."""
+        return option_id in self.protected_options
+
     def get_all_options(self):
         """Get all options"""
         return {idx: opt for idx, opt in enumerate(self.options) if opt is not None}
@@ -214,7 +219,37 @@ class OptionLibrary:
 
         option.option_id = option_id
         self.options[option_id] = option
+        self._configure_option_optimizers(option)
         return option_id, appended
+
+    def _meta_config_for(self, enabled, base_lr):
+        if self.meta_template is None or not enabled:
+            return None
+        cfg = self.meta_template.copy()
+        if base_lr is not None and base_lr > 0:
+            cfg['init_log_alpha'] = math.log(base_lr)
+        cfg['disabled'] = False
+        return cfg
+
+    def _configure_option_optimizers(self, option):
+        if option is None:
+            return
+        policy_lr = getattr(self.config, 'OPTION_POLICY_LR', option.policy_lr)
+        value_lr = getattr(self.config, 'OPTION_VALUE_LR', option.value_lr)
+        policy_meta = self._meta_config_for(
+            getattr(self.config, 'OPTION_POLICY_META_ENABLED', True),
+            policy_lr,
+        )
+        value_meta = self._meta_config_for(
+            getattr(self.config, 'OPTION_VALUE_META_ENABLED', True),
+            value_lr,
+        )
+        option.configure_optimizers(
+            policy_lr=policy_lr,
+            value_lr=value_lr,
+            policy_meta_config=policy_meta,
+            value_meta_config=value_meta,
+        )
 
     def can_initiate(self, option_id, state):
         option = self.get_option(option_id)

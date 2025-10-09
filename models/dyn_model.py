@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from meta.meta_optimizer import MetaOptimizerAdapter
+
 class DynamicsNet(nn.Module):
     """Single dynamics model: (s, a) -> (Δs, r)"""
 
@@ -81,7 +83,7 @@ class DynamicsEnsemble:
     Predicts p(s', r | s, a) via ensemble mean/variance
     """
 
-    def __init__(self, state_dim, action_dim, ensemble_size=3, hidden_size=128, lr=1e-3):
+    def __init__(self, state_dim, action_dim, ensemble_size=3, hidden_size=128, lr=1e-3, meta_config=None):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.ensemble_size = ensemble_size
@@ -92,9 +94,11 @@ class DynamicsEnsemble:
             for _ in range(ensemble_size)
         ]
 
+        meta_cfg = meta_config.copy() if meta_config is not None else None
+
         # Optimizers for each model
         self.optimizers = [
-            torch.optim.Adam(model.parameters(), lr=lr)
+            MetaOptimizerAdapter(model.parameters(), base_lr=lr, meta_config=meta_cfg)
             for model in self.models
         ]
 
@@ -191,7 +195,10 @@ class DynamicsEnsemble:
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            feature_vec = state.detach().cpu().numpy().reshape(-1)
+            optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
 
             total_loss += loss.item()
 

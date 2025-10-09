@@ -15,6 +15,7 @@ OaK Loop (from OaK_principles.md):
    - Step-sizes (IDBD)
 6. Periodically run FC-STOMP
 """
+import math
 import numpy as np
 import torch
 from collections import deque, defaultdict
@@ -48,6 +49,7 @@ class OaKAgent:
                 'init_log_alpha': config.META_INIT_LOG_ALPHA,
                 'min_alpha': config.META_MIN_ALPHA,
                 'max_alpha': config.META_MAX_ALPHA,
+                'disabled': False,
             }
 
         # Replay buffers
@@ -63,27 +65,36 @@ class OaKAgent:
         )
 
         # Knowledge layer (GVFs)
-        self.horde = HordeGVFs(self.env.state_dim, config)
+        horde_meta = self._module_meta_config(config.GVF_META_ENABLED, config.GVF_LR)
+        self.horde = HordeGVFs(self.env.state_dim, config, meta_config=horde_meta)
 
         # World models
         self.dyn_model = DynamicsEnsemble(
             state_dim=self.env.state_dim,
             action_dim=self.env.action_dim,
             ensemble_size=config.DYN_ENSEMBLE_SIZE,
-            hidden_size=config.DYN_HIDDEN_SIZE
+            hidden_size=config.DYN_HIDDEN_SIZE,
+            lr=config.DYN_LR,
+            meta_config=self._module_meta_config(config.DYN_META_ENABLED, config.DYN_LR)
         )
         self.option_models = OptionModelLibrary(
             state_dim=self.env.state_dim,
             hidden_size=config.Q_OPTION_HIDDEN_SIZE,
+            lr=config.OPTION_MODEL_LR,
             min_rollouts=config.OPTION_MODEL_MIN_ROLLOUTS,
-            error_threshold=config.OPTION_MODEL_ERROR_THRESHOLD
+            error_threshold=config.OPTION_MODEL_ERROR_THRESHOLD,
+            meta_config=self._module_meta_config(
+                config.OPTION_MODEL_META_ENABLED,
+                config.OPTION_MODEL_LR,
+            ),
         )
 
         # Options
         self.option_library = OptionLibrary(
             self.env.state_dim,
             self.env.action_dim,
-            config
+            config,
+            meta_config=self.meta_config.copy() if self.meta_config is not None else None,
         )
 
         # Value functions
@@ -452,6 +463,15 @@ class OaKAgent:
             }
 
         return metrics
+
+    def _module_meta_config(self, enabled, base_lr):
+        if self.meta_config is None or not enabled:
+            return None
+        cfg = self.meta_config.copy()
+        if base_lr is not None and base_lr > 0:
+            cfg['init_log_alpha'] = math.log(base_lr)
+        cfg['disabled'] = False
+        return cfg
 
     def evaluate(self, num_episodes):
         """Evaluate agent performance"""

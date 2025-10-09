@@ -33,6 +33,8 @@ class Config:
     GVF_GAMMA_LONG = 0.99  # for g4 (survival, normalized horizon)
     GVF_TRAIN_STEPS = 15  # M3
     GVF_BUFFER_SIZE = 1000  # ring buffer for feature mining
+    GVF_LR = 1e-3
+    GVF_META_ENABLED = True
 
     # Options
     OPTION_MAX_LENGTH = 10
@@ -42,12 +44,21 @@ class Config:
     OPTION_POLICY_HIDDEN = 64
     OPTION_MODEL_MIN_ROLLOUTS = 2
     OPTION_MODEL_ERROR_THRESHOLD = 2.0
+    OPTION_PROTECTED_IDS = []  # Options shielded from pruning (default: none)
+    OPTION_POLICY_LR = 1e-3
+    OPTION_VALUE_LR = 1e-3
+    OPTION_POLICY_META_ENABLED = True
+    OPTION_VALUE_META_ENABLED = True
+    OPTION_MODEL_LR = 1e-3
+    OPTION_MODEL_META_ENABLED = True
 
     # Planner (Dyna)
     PLANNER_TYPE = "dyna"  # or "mpc"
     DYNA_PLAN_STEPS = 60  # M_plan
     DYNA_HORIZON = 11  # H
     DYNA_NUM_RECENT_STATES = 100  # B: recent states to sample from
+    DYN_LR = 1e-3
+    DYN_META_ENABLED = True
 
     # MPC (alternative planner)
     MPC_NUM_SEQUENCES = 100  # N
@@ -67,6 +78,7 @@ class Config:
     FC_FEATURE_RELAX_STEPS = 1200  # steps to use relaxed threshold
     FC_HISTORY_MIN_LENGTH = 20  # minimum samples before evaluating feature
     FC_MIN_CONTROLLABILITY = 0.10  # min action contrast via model lookahead (warm-up)
+    FC_MIN_CONTROLLABILITY_BOOTSTRAP = 0.05  # relaxed gate while no options exist
     FC_CONTROLLABILITY_H = 3  # horizon for model-based action contrast
     FC_FEATURE_SPAWN_COOLDOWN = 400  # per-feature cooldown between spawned options
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
