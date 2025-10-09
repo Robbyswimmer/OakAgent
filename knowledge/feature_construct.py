@@ -462,7 +462,7 @@ class OptionPruner:
         # Track option performance
         self.option_performance = {}
 
-    def evaluate_options(self):
+    def evaluate_options(self, recent_usage=None):
         """
         Evaluate all options and identify candidates for pruning
 
@@ -472,6 +472,8 @@ class OptionPruner:
         to_prune = []
 
         stats = self.option_library.get_statistics()
+        recent_usage = recent_usage or {}
+        recent_min_starts = getattr(self.config, 'FC_OPTION_PRUNE_RECENT_STARTS', 5)
 
         for option_id, option_stats in stats.items():
             if option_stats['executions'] < 10:
@@ -482,8 +484,20 @@ class OptionPruner:
             # 1. Low success rate
             if option_stats['success_rate'] < self.config.FC_OPTION_SUCCESS_THRESHOLD:
                 to_prune.append(option_id)
+                continue
 
-            # 2. Never used recently (could add usage tracking)
+            # 2. Recent usage underperforms
+            if option_id >= 4:
+                usage_stats = recent_usage.get(option_id)
+                if usage_stats:
+                    if (
+                        usage_stats['starts'] >= recent_min_starts
+                        and usage_stats['success_rate'] < self.config.FC_OPTION_SUCCESS_THRESHOLD
+                    ):
+                        to_prune.append(option_id)
+                        continue
+                elif recent_usage is not None and recent_min_starts > 0:
+                    to_prune.append(option_id)
 
         return to_prune
 
@@ -520,7 +534,13 @@ class FCSTOMPManager:
         self.subtask_to_option = {}
         self.feature_last_spawn_step = {}
 
-    def run_fc_stomp_cycle(self, current_step, state_history=None, action_history=None):
+    def run_fc_stomp_cycle(
+        self,
+        current_step,
+        state_history=None,
+        action_history=None,
+        recent_option_usage=None,
+    ):
         """
         Execute one FC-STOMP cycle
 
@@ -528,6 +548,7 @@ class FCSTOMPManager:
             current_step: current training step
             state_history: recent state history (for controllability analysis)
             action_history: recent action history
+            recent_option_usage: aggregated option usage metrics over recent episodes
 
         Returns:
             dict with cycle results
@@ -585,7 +606,7 @@ class FCSTOMPManager:
                     results['options_created'] += 1
 
         # Prune underperforming options
-        options_to_prune = self.pruner.evaluate_options()
+        options_to_prune = self.pruner.evaluate_options(recent_option_usage)
         for option_id in options_to_prune:
             # Only prune if not a core option (keep 0-3)
             if option_id >= 4:

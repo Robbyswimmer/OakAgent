@@ -71,6 +71,7 @@ class Config:
     FC_FEATURE_SPAWN_COOLDOWN = 400  # per-feature cooldown between spawned options
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
     FC_OPTION_SUCCESS_THRESHOLD = 0.10  # min success rate to keep option
+    FC_OPTION_PRUNE_RECENT_STARTS = 5  # min recent executions before windowed pruning
     FC_SURVIVAL_TARGET = 200.0
     FC_USAGE_WINDOW = 5  # episodes for option usage summaries
 

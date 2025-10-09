@@ -231,10 +231,12 @@ class OaKAgent:
                 for _ in range(steps_elapsed):
                     self.total_steps += 1
                     if self.fc_stomp.should_run(self.total_steps):
+                        recent_usage_metrics = self._get_recent_option_usage_stats()
                         fc_results = self.fc_stomp.run_fc_stomp_cycle(
                             self.total_steps,
                             list(self.state_history),
-                            list(self.action_history)
+                            list(self.action_history),
+                            recent_option_usage=recent_usage_metrics,
                         )
                         # Enhanced FC-STOMP logging
                         print(f"  FC-STOMP @ step {fc_results['step']}:")
@@ -417,6 +419,39 @@ class OaKAgent:
             parts.append(f"{opt_id}:{starts}x/{avg_duration:.1f}st/{success_rate*100:.0f}%")
 
         return ', '.join(parts)
+
+    def _get_recent_option_usage_stats(self, window=None):
+        """Aggregate option usage metrics over the recent window."""
+        if not self.episode_option_stats:
+            return {}
+
+        window = window or getattr(self.config, 'FC_USAGE_WINDOW', 5)
+        recent_stats = self.episode_option_stats[-window:]
+        aggregate = {}
+
+        for stats in recent_stats:
+            counts = stats.get('counts', {})
+            durations = stats.get('durations', {})
+            successes = stats.get('successes', {})
+
+            for opt_id, starts in counts.items():
+                entry = aggregate.setdefault(opt_id, {'starts': 0, 'duration': 0.0, 'success': 0})
+                entry['starts'] += starts
+                entry['duration'] += durations.get(opt_id, 0.0)
+                entry['success'] += successes.get(opt_id, 0)
+
+        metrics = {}
+        for opt_id, data in aggregate.items():
+            starts = data['starts']
+            if starts <= 0:
+                continue
+            metrics[opt_id] = {
+                'starts': starts,
+                'avg_duration': data['duration'] / starts,
+                'success_rate': data['success'] / starts,
+            }
+
+        return metrics
 
     def evaluate(self, num_episodes):
         """Evaluate agent performance"""
