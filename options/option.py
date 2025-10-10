@@ -69,6 +69,7 @@ class Option:
         self.execution_count = 0
         self.success_count = 0
         self.total_duration = 0
+        self.creation_step = 0
 
         # Value function for intra-option learning (optional)
         self.value_net = nn.Sequential(

@@ -78,12 +78,15 @@ class Config:
     FC_FEATURE_RELAX_STEPS = 1200  # steps to use relaxed threshold
     FC_HISTORY_MIN_LENGTH = 20  # minimum samples before evaluating feature
     FC_MIN_CONTROLLABILITY = 0.10  # min action contrast via model lookahead (warm-up)
+    FC_MODEL_CONTROLLABILITY_MIN = 0.20  # minimum model-based contrast to treat feature as controllable
     FC_MIN_CONTROLLABILITY_BOOTSTRAP = 0.05  # relaxed gate while no options exist
     FC_CONTROLLABILITY_H = 3  # horizon for model-based action contrast
     FC_FEATURE_SPAWN_COOLDOWN = 400  # per-feature cooldown between spawned options
     FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
     FC_OPTION_SUCCESS_THRESHOLD = 0.10  # min success rate to keep option
     FC_OPTION_PRUNE_RECENT_STARTS = 5  # min recent executions before windowed pruning
+    FC_OPTION_PRUNE_MIN_AGE_STEPS = 1500  # minimum env steps before pruning new option
+    FC_OPTION_MIN_EXECUTIONS = 20  # minimum executions before considering pruning
     FC_SURVIVAL_TARGET = 200.0
     FC_USAGE_WINDOW = 5  # episodes for option usage summaries
 

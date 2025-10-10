@@ -39,6 +39,8 @@ instantiate, but nothing is pre-seeded.
 - Option policies, critics, and option models meta-learn their step-sizes online when
   `OPTION_POLICY_META_ENABLED`, `OPTION_VALUE_META_ENABLED`, and
   `OPTION_MODEL_META_ENABLED` are enabled.
+- Setting `FC_MODEL_CONTROLLABILITY_MIN` lets FC-STOMP promote features purely from
+  the model-based contrast even when the variance heuristic hasn't stabilised yet.
 
 Each option has:
 - Initiation set I (currently: all states)
@@ -143,6 +145,8 @@ Key hyperparameters in `config.py`:
   `OPTION_POLICY_META_ENABLED`, `OPTION_VALUE_META_ENABLED`, and
   `OPTION_MODEL_META_ENABLED` control per-module IDBD updates. Their matching
   `*_LR` constants set the base learning rates and initialize the meta step-sizes.
+  `FC_MODEL_CONTROLLABILITY_MIN` tunes the minimum Δ-based contrast required before
+  FC-STOMP spawns a new option via model lookahead.
 - **Options**: max length=10, termination thresholds configurable
 - **Planner**: 20 Dyna steps, horizon=5
 - **FC-STOMP**: Runs every 1000 environment steps

@@ -462,7 +462,7 @@ class OptionPruner:
         # Track option performance
         self.option_performance = {}
 
-    def evaluate_options(self, recent_usage=None):
+    def evaluate_options(self, current_step, recent_usage=None):
         """
         Evaluate all options and identify candidates for pruning
 
@@ -475,8 +475,18 @@ class OptionPruner:
         recent_usage = recent_usage or {}
         recent_min_starts = getattr(self.config, 'FC_OPTION_PRUNE_RECENT_STARTS', 5)
 
+        min_executions = getattr(self.config, 'FC_OPTION_MIN_EXECUTIONS', 10)
+        min_age = getattr(self.config, 'FC_OPTION_PRUNE_MIN_AGE_STEPS', 0)
+
         for option_id, option_stats in stats.items():
-            if option_stats['executions'] < 10:
+            option = self.option_library.get_option(option_id)
+
+            if option is not None and hasattr(option, 'creation_step'):
+                option_age = current_step - option.creation_step
+                if option_age < min_age:
+                    continue
+
+            if option_stats['executions'] < max(min_executions, 10):
                 # Not enough data yet
                 continue
 
@@ -579,17 +589,20 @@ class FCSTOMPManager:
                 max(0.0, self.config.FC_MIN_CONTROLLABILITY * 0.5),
             )
 
+        considered_features = {fi['name'] for fi in promising_features}
+
         for feature_info in promising_features:
             # Check controllability using model-based lookahead if available
             if state_history and self.dyn_model is not None:
                 gvf = feature_info['gvf']
-                recent_states = list(state_history)[-500:]  # use last 500 states
-                controllability = self.feature_constructor.compute_model_based_controllability(
+                recent_states = list(state_history)[-self.config.GVF_BUFFER_SIZE :]
+                controllability_model = self.feature_constructor.compute_model_based_controllability(
                     gvf,
                     recent_states,
                     horizon=getattr(self.config, 'FC_CONTROLLABILITY_H', 2),
                 )
-                feature_info['controllability'] = controllability
+                base_controllability = feature_info.get('controllability', 0.0)
+                feature_info['controllability'] = max(base_controllability, controllability_model)
             elif state_history and action_history:
                 # Fallback to historical correlation method
                 controllability = self.feature_constructor.analyze_feature_controllability(
@@ -614,11 +627,55 @@ class FCSTOMPManager:
                 if created:
                     results['options_created'] += 1
 
+        # Consider model-based controllability for features that were not initially marked promising
+        if state_history and self.dyn_model is not None:
+            recent_states = list(state_history)[-self.config.GVF_BUFFER_SIZE :]
+            if recent_states:
+                delta_threshold = getattr(
+                    self.config,
+                    'FC_MODEL_CONTROLLABILITY_MIN',
+                    min_controllability,
+                )
+                horizon = getattr(self.config, 'FC_CONTROLLABILITY_H', 2)
+                for name, gvf in self.horde.gvfs.items():
+                    if name in considered_features:
+                        continue
+                    model_ctrl = self.feature_constructor.compute_model_based_controllability(
+                        gvf,
+                        recent_states,
+                        horizon=horizon,
+                    )
+                    if model_ctrl < delta_threshold:
+                        continue
+
+                    stats_idx = next(
+                        (idx for idx, snapshot in enumerate(results['feature_stats']) if snapshot['name'] == name),
+                        None,
+                    )
+
+                    feature_info = {
+                        'name': name,
+                        'gvf': gvf,
+                        'controllability': model_ctrl,
+                    }
+
+                    if stats_idx is not None:
+                        results['feature_stats'][stats_idx]['controllability'] = model_ctrl
+
+                    if model_ctrl >= min_controllability:
+                        subtask = self.subtask_former.create_subtask(feature_info)
+                        results['subtasks_formed'] += 1
+
+                        created = self._ensure_option_for_subtask(subtask, current_step)
+                        if created:
+                            results['options_created'] += 1
+                            considered_features.add(name)
+
         if optionless and results['options_created'] == 0:
             print("[FC-STOMP] Scouting phase: no controllable features yet; retrying later.")
 
         # Prune underperforming options
-        options_to_prune = self.pruner.evaluate_options(recent_option_usage)
+        options_to_prune = self.pruner.evaluate_options(current_step, recent_option_usage)
         for option_id in options_to_prune:
             # Only process options that are not protected by configuration.
             if not self.option_library.is_protected(option_id):
@@ -678,6 +735,9 @@ class FCSTOMPManager:
         self.subtask_to_option[name] = option_id
         if feature_name is not None:
             self.feature_last_spawn_step[feature_name] = current_step
+        option = self.option_library.get_option(option_id)
+        if option is not None and hasattr(option, 'creation_step'):
+            option.creation_step = current_step
         return True
 
     def should_run(self, current_step):

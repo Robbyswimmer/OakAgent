@@ -93,7 +93,8 @@ class GVF(nn.Module):
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
-        return self.net(state).squeeze(-1)
+        prediction = self.net(state).squeeze(-1)
+        return torch.clamp(prediction, -5.0, 5.0)
 
     def compute_td_error(self, state, cumulant, next_state, gamma=None):
         """
