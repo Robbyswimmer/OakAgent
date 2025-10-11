@@ -652,7 +652,34 @@ class FCSTOMPManager:
         results['features_mined'] = len(promising_features)
         results['feature_stats'] = feature_stats
 
-        # C: Subtask Formation
+        # P: Prune underperforming options FIRST (OaK continual adaptation)
+        # This clears space for immediate recreation from controllable features
+        options_to_prune = self.pruner.evaluate_options(current_step, recent_option_usage)
+        for option_id in options_to_prune:
+            # Only process options that are not protected by configuration.
+            if not self.option_library.is_protected(option_id):
+                if hasattr(self.option_models, 'remove_option'):
+                    self.option_models.remove_option(option_id)
+                if hasattr(self.q_option, 'reset_option'):
+                    self.q_option.reset_option(option_id)
+                self.pruner.prune_option(option_id)
+
+                # Clean up subtask mappings for pruned option
+                subtasks_to_remove = [
+                    subtask_name for subtask_name, opt_id in self.subtask_to_option.items()
+                    if opt_id == option_id
+                ]
+                for subtask_name in subtasks_to_remove:
+                    del self.subtask_to_option[subtask_name]
+
+                # Clear spawn cooldown to allow immediate recreation
+                # (We don't know feature_name from option_id, so clear all cooldowns when pruning)
+                if subtasks_to_remove:
+                    self.feature_last_spawn_step.clear()
+
+                results['options_pruned'] += 1
+
+        # C: Subtask Formation (after pruning, space cleared for new options)
         optionless = not self.option_library.get_option_ids()
         min_controllability = self.config.FC_MIN_CONTROLLABILITY
         if optionless:
@@ -746,18 +773,6 @@ class FCSTOMPManager:
 
         if optionless and results['options_created'] == 0:
             print("[FC-STOMP] Scouting phase: no controllable features yet; retrying later.")
-
-        # Prune underperforming options
-        options_to_prune = self.pruner.evaluate_options(current_step, recent_option_usage)
-        for option_id in options_to_prune:
-            # Only process options that are not protected by configuration.
-            if not self.option_library.is_protected(option_id):
-                if hasattr(self.option_models, 'remove_option'):
-                    self.option_models.remove_option(option_id)
-                if hasattr(self.q_option, 'reset_option'):
-                    self.q_option.reset_option(option_id)
-                self.pruner.prune_option(option_id)
-                results['options_pruned'] += 1
 
         # Log event
         self.fc_stomp_history.append(results)

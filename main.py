@@ -199,9 +199,9 @@ class OaKAgent:
                         # Update option policy
                         option = self.option_library.get_option(action_or_option)
                         if option:
-                            # Create pseudo-reward trajectory
+                            # Create pseudo-reward trajectory (reward based on next state)
                             pseudo_traj = [
-                                (t[0], t[1], option.compute_pseudo_reward(t[0]), t[3])
+                                (t[0], t[1], option.compute_pseudo_reward(t[3]), t[3])
                                 for t in trajectory
                             ]
                             option.update_policy(pseudo_traj)
