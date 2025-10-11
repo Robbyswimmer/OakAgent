@@ -148,7 +148,40 @@ class FeatureConstructor:
 
             # Criteria for promising features:
             count = len(predictions)
-            variance = _safe_variance(predictions) if count > 0 else float('nan')
+
+            # Compute variance on DIVERSE sampled states, not just recent trajectory
+            # This breaks chicken-and-egg: poor exploration → similar states → low variance → no options
+            if state_history and len(state_history) >= 20:
+                # Sample 50 diverse states by adding noise to recent states
+                n_samples = min(50, len(state_history))
+                sample_indices = np.random.choice(len(state_history), n_samples, replace=False)
+                base_states = [state_history[i] for i in sample_indices]
+
+                diverse_predictions = []
+                gvf = self.horde.gvfs[gvf_name]
+                for base_state in base_states:
+                    if base_state is None or not np.all(np.isfinite(base_state)):
+                        continue
+                    # Add noise to create state diversity
+                    noise_scale = 0.3  # moderate noise
+                    noisy_state = base_state + np.random.randn(len(base_state)) * noise_scale
+                    # Clip to valid bounds
+                    noisy_state[0] = np.clip(noisy_state[0], -2.4, 2.4)  # x
+                    noisy_state[1] = np.clip(noisy_state[1], -3.0, 3.0)  # x_dot
+                    noisy_state[2] = np.clip(noisy_state[2], -0.21, 0.21)  # theta
+                    noisy_state[3] = np.clip(noisy_state[3], -3.0, 3.0)  # theta_dot
+
+                    pred = gvf.predict(noisy_state)
+                    if np.isfinite(pred):
+                        diverse_predictions.append(pred)
+
+                # Use diverse variance if we got enough samples
+                if len(diverse_predictions) >= 20:
+                    variance = _safe_variance(diverse_predictions)
+                else:
+                    variance = _safe_variance(predictions) if count > 0 else float('nan')
+            else:
+                variance = _safe_variance(predictions) if count > 0 else float('nan')
             variance_threshold = self.config.FC_FEATURE_VARIANCE_THRESHOLD
             relaxed_threshold = getattr(
                 self.config, 'FC_FEATURE_INITIAL_VARIANCE', variance_threshold
@@ -300,8 +333,8 @@ class FeatureConstructor:
         if self.dyn_model is None or not recent_states:
             return 0.0
 
-        # Sample up to 200 states for efficiency
-        n_samples = min(200, len(recent_states))
+        # Sample up to 100 states for efficiency (reduced from 200)
+        n_samples = min(100, len(recent_states))
         if n_samples < 10:
             return 0.0
 
@@ -309,6 +342,8 @@ class FeatureConstructor:
         sampled_states = [recent_states[i] for i in sample_indices]
 
         contrasts = []
+        raw_scores_left = []
+        raw_scores_right = []
 
         for state in sampled_states:
             if state is None or not np.all(np.isfinite(state)):
@@ -321,6 +356,7 @@ class FeatureConstructor:
                 s_sim = np.array(state, dtype=np.float32, copy=True)
                 cumulative_gvf = 0.0
                 discount = 1.0
+                valid_horizon = True
 
                 for h in range(horizon):
                     # One-step model prediction
@@ -330,34 +366,71 @@ class FeatureConstructor:
                     if isinstance(s_next, torch.Tensor):
                         s_next = s_next.squeeze(0).cpu().numpy()
 
+                    # Check for valid state
+                    if not np.all(np.isfinite(s_next)):
+                        valid_horizon = False
+                        break
+
+                    # Early stop if terminal-looking state
+                    if abs(s_next[0]) > 2.4 or abs(s_next[2]) > 0.2095:
+                        valid_horizon = False
+                        break
+
                     # GVF prediction at next state
                     gvf_value = gvf.predict(s_next)
 
                     if not np.isfinite(gvf_value):
+                        valid_horizon = False
                         break
 
+                    # Clip GVF values to reasonable range to prevent instability
+                    gvf_value = np.clip(gvf_value, 0.0, 10.0)
                     cumulative_gvf += discount * gvf_value
                     discount *= 0.9  # decay for multi-step
                     s_sim = s_next
 
-                    # Early stop if terminal-looking state
-                    if abs(s_sim[0]) > 2.4 or abs(s_sim[2]) > 0.2095:
-                        break
-
-                action_scores.append(cumulative_gvf)
+                if valid_horizon:
+                    action_scores.append(cumulative_gvf)
+                    if action == 0:
+                        raw_scores_left.append(cumulative_gvf)
+                    else:
+                        raw_scores_right.append(cumulative_gvf)
 
             # Contrast between actions
             if len(action_scores) == 2:
                 contrast = abs(action_scores[0] - action_scores[1])
                 if np.isfinite(contrast):
-                    contrasts.append(np.clip(contrast, 0.0, 1.5))
+                    contrasts.append(contrast)
 
         if not contrasts:
             return 0.0
 
+        # Use median and robust statistics to reduce outlier impact
         contrasts = np.array(contrasts, dtype=np.float64)
-        score = float(np.tanh(contrasts.mean()))
+
+        # Remove outliers (values > 3 std from median)
+        median_contrast = np.median(contrasts)
+        std_contrast = np.std(contrasts)
+        if std_contrast > 0:
+            mask = np.abs(contrasts - median_contrast) <= 3.0 * std_contrast
+            contrasts = contrasts[mask]
+
+        if len(contrasts) == 0:
+            return 0.0
+
+        # Normalize by typical GVF scale to make contrast meaningful
+        typical_gvf_scale = max(np.mean(raw_scores_left + raw_scores_right), 0.1)
+        normalized_contrast = contrasts.mean() / typical_gvf_scale
+
+        # Apply sigmoid to get score in [0, 1]
+        score = float(np.tanh(normalized_contrast * 2.0))  # scale factor for sensitivity
         score = max(0.0, min(1.0, score))
+
+        # Exponential moving average for temporal smoothing
+        if len(self.controllability_log) > 0:
+            prev_score = self.controllability_log[-1]
+            score = 0.7 * score + 0.3 * prev_score  # smooth with previous
+
         self.controllability_log.append(score)
         return score
 
@@ -462,7 +535,7 @@ class OptionPruner:
         # Track option performance
         self.option_performance = {}
 
-    def evaluate_options(self, recent_usage=None):
+    def evaluate_options(self, current_step, recent_usage=None):
         """
         Evaluate all options and identify candidates for pruning
 
@@ -475,8 +548,18 @@ class OptionPruner:
         recent_usage = recent_usage or {}
         recent_min_starts = getattr(self.config, 'FC_OPTION_PRUNE_RECENT_STARTS', 5)
 
+        min_executions = getattr(self.config, 'FC_OPTION_MIN_EXECUTIONS', 10)
+        min_age = getattr(self.config, 'FC_OPTION_PRUNE_MIN_AGE_STEPS', 0)
+
         for option_id, option_stats in stats.items():
-            if option_stats['executions'] < 10:
+            option = self.option_library.get_option(option_id)
+
+            if option is not None and hasattr(option, 'creation_step'):
+                option_age = current_step - option.creation_step
+                if option_age < min_age:
+                    continue
+
+            if option_stats['executions'] < max(min_executions, 10):
                 # Not enough data yet
                 continue
 
@@ -486,8 +569,8 @@ class OptionPruner:
                 to_prune.append(option_id)
                 continue
 
-            # 2. Recent usage underperforms
-            if option_id >= 4:
+            # 2. Recent usage underperforms (skip protected options)
+            if not self.option_library.is_protected(option_id):
                 usage_stats = recent_usage.get(option_id)
                 if usage_stats:
                     if (
@@ -569,18 +652,57 @@ class FCSTOMPManager:
         results['features_mined'] = len(promising_features)
         results['feature_stats'] = feature_stats
 
-        # C: Subtask Formation
+        # P: Prune underperforming options FIRST (OaK continual adaptation)
+        # This clears space for immediate recreation from controllable features
+        options_to_prune = self.pruner.evaluate_options(current_step, recent_option_usage)
+        for option_id in options_to_prune:
+            # Only process options that are not protected by configuration.
+            if not self.option_library.is_protected(option_id):
+                if hasattr(self.option_models, 'remove_option'):
+                    self.option_models.remove_option(option_id)
+                if hasattr(self.q_option, 'reset_option'):
+                    self.q_option.reset_option(option_id)
+                self.pruner.prune_option(option_id)
+
+                # Clean up subtask mappings for pruned option
+                subtasks_to_remove = [
+                    subtask_name for subtask_name, opt_id in self.subtask_to_option.items()
+                    if opt_id == option_id
+                ]
+                for subtask_name in subtasks_to_remove:
+                    del self.subtask_to_option[subtask_name]
+
+                # Clear spawn cooldown to allow immediate recreation
+                # (We don't know feature_name from option_id, so clear all cooldowns when pruning)
+                if subtasks_to_remove:
+                    self.feature_last_spawn_step.clear()
+
+                results['options_pruned'] += 1
+
+        # C: Subtask Formation (after pruning, space cleared for new options)
+        optionless = not self.option_library.get_option_ids()
+        min_controllability = self.config.FC_MIN_CONTROLLABILITY
+        if optionless:
+            min_controllability = getattr(
+                self.config,
+                'FC_MIN_CONTROLLABILITY_BOOTSTRAP',
+                max(0.0, self.config.FC_MIN_CONTROLLABILITY * 0.5),
+            )
+
+        considered_features = {fi['name'] for fi in promising_features}
+
         for feature_info in promising_features:
             # Check controllability using model-based lookahead if available
             if state_history and self.dyn_model is not None:
                 gvf = feature_info['gvf']
-                recent_states = list(state_history)[-500:]  # use last 500 states
-                controllability = self.feature_constructor.compute_model_based_controllability(
+                recent_states = list(state_history)[-self.config.GVF_BUFFER_SIZE :]
+                controllability_model = self.feature_constructor.compute_model_based_controllability(
                     gvf,
                     recent_states,
                     horizon=getattr(self.config, 'FC_CONTROLLABILITY_H', 2),
                 )
-                feature_info['controllability'] = controllability
+                base_controllability = feature_info.get('controllability', 0.0)
+                feature_info['controllability'] = max(base_controllability, controllability_model)
             elif state_history and action_history:
                 # Fallback to historical correlation method
                 controllability = self.feature_constructor.analyze_feature_controllability(
@@ -595,8 +717,8 @@ class FCSTOMPManager:
                 )
             feature_info.pop('stats_index', None)
 
-            # Only create subtask if controllable enough
-            if feature_info['controllability'] >= self.config.FC_MIN_CONTROLLABILITY:
+            # Only create subtask if controllable enough (relaxed if no options yet)
+            if feature_info['controllability'] >= min_controllability:
                 subtask = self.subtask_former.create_subtask(feature_info)
                 results['subtasks_formed'] += 1
 
@@ -605,17 +727,52 @@ class FCSTOMPManager:
                 if created:
                     results['options_created'] += 1
 
-        # Prune underperforming options
-        options_to_prune = self.pruner.evaluate_options(recent_option_usage)
-        for option_id in options_to_prune:
-            # Only prune if not a core option (keep 0-3)
-            if option_id >= 4:
-                if hasattr(self.option_models, 'remove_option'):
-                    self.option_models.remove_option(option_id)
-                if hasattr(self.q_option, 'reset_option'):
-                    self.q_option.reset_option(option_id)
-                self.pruner.prune_option(option_id)
-                results['options_pruned'] += 1
+        # Consider model-based controllability for features that were not initially marked promising
+        if state_history and self.dyn_model is not None:
+            recent_states = list(state_history)[-self.config.GVF_BUFFER_SIZE :]
+            if recent_states:
+                delta_threshold = getattr(
+                    self.config,
+                    'FC_MODEL_CONTROLLABILITY_MIN',
+                    min_controllability,
+                )
+                horizon = getattr(self.config, 'FC_CONTROLLABILITY_H', 2)
+                for name, gvf in self.horde.gvfs.items():
+                    if name in considered_features:
+                        continue
+                    model_ctrl = self.feature_constructor.compute_model_based_controllability(
+                        gvf,
+                        recent_states,
+                        horizon=horizon,
+                    )
+                    if model_ctrl < delta_threshold:
+                        continue
+
+                    stats_idx = next(
+                        (idx for idx, snapshot in enumerate(results['feature_stats']) if snapshot['name'] == name),
+                        None,
+                    )
+
+                    feature_info = {
+                        'name': name,
+                        'gvf': gvf,
+                        'controllability': model_ctrl,
+                    }
+
+                    if stats_idx is not None:
+                        results['feature_stats'][stats_idx]['controllability'] = model_ctrl
+
+                    if model_ctrl >= min_controllability:
+                        subtask = self.subtask_former.create_subtask(feature_info)
+                        results['subtasks_formed'] += 1
+
+                        created = self._ensure_option_for_subtask(subtask, current_step)
+                        if created:
+                            results['options_created'] += 1
+                            considered_features.add(name)
+
+        if optionless and results['options_created'] == 0:
+            print("[FC-STOMP] Scouting phase: no controllable features yet; retrying later.")
 
         # Log event
         self.fc_stomp_history.append(results)
@@ -666,6 +823,9 @@ class FCSTOMPManager:
         self.subtask_to_option[name] = option_id
         if feature_name is not None:
             self.feature_last_spawn_step[feature_name] = current_step
+        option = self.option_library.get_option(option_id)
+        if option is not None and hasattr(option, 'creation_step'):
+            option.creation_step = current_step
         return True
 
     def should_run(self, current_step):

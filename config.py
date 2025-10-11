@@ -33,6 +33,8 @@ class Config:
     GVF_GAMMA_LONG = 0.99  # for g4 (survival, normalized horizon)
     GVF_TRAIN_STEPS = 15  # M3
     GVF_BUFFER_SIZE = 1000  # ring buffer for feature mining
+    GVF_LR = 3e-3  # Increased to adapt faster to non-stationary policy
+    GVF_META_ENABLED = True
 
     # Options
     OPTION_MAX_LENGTH = 10
@@ -42,12 +44,21 @@ class Config:
     OPTION_POLICY_HIDDEN = 64
     OPTION_MODEL_MIN_ROLLOUTS = 2
     OPTION_MODEL_ERROR_THRESHOLD = 2.0
+    OPTION_PROTECTED_IDS = []  # Options shielded from pruning (default: none)
+    OPTION_POLICY_LR = 5e-4  # Lower for stability
+    OPTION_VALUE_LR = 5e-4  # Lower for stability
+    OPTION_POLICY_META_ENABLED = True
+    OPTION_VALUE_META_ENABLED = True
+    OPTION_MODEL_LR = 1e-3  # Increased for faster option model learning
+    OPTION_MODEL_META_ENABLED = True
 
     # Planner (Dyna)
     PLANNER_TYPE = "dyna"  # or "mpc"
     DYNA_PLAN_STEPS = 60  # M_plan
     DYNA_HORIZON = 11  # H
     DYNA_NUM_RECENT_STATES = 100  # B: recent states to sample from
+    DYN_LR = 1e-3
+    DYN_META_ENABLED = True
 
     # MPC (alternative planner)
     MPC_NUM_SEQUENCES = 100  # N
@@ -62,35 +73,42 @@ class Config:
 
     # FC-STOMP (post-normalization thresholds for GVF values ∈ [0,1])
     FC_STOMP_FREQ = 500  # T_FC: env steps between feature construction
-    FC_FEATURE_VARIANCE_THRESHOLD = 0.04  # tighter gate once GVFs are normalized
-    FC_FEATURE_INITIAL_VARIANCE = 0.06  # relaxed threshold early in training
+    FC_FEATURE_VARIANCE_THRESHOLD = 0.02  # relaxed to allow option creation
+    FC_FEATURE_INITIAL_VARIANCE = 0.04  # relaxed threshold early in training
     FC_FEATURE_RELAX_STEPS = 1200  # steps to use relaxed threshold
     FC_HISTORY_MIN_LENGTH = 20  # minimum samples before evaluating feature
-    FC_MIN_CONTROLLABILITY = 0.10  # min action contrast via model lookahead (warm-up)
+    FC_MIN_CONTROLLABILITY = 0.08  # Lower for more option creation
+    FC_MODEL_CONTROLLABILITY_MIN = 0.15  # Lower threshold for controllability
+    FC_MIN_CONTROLLABILITY_BOOTSTRAP = 0.05  # relaxed gate while no options exist
     FC_CONTROLLABILITY_H = 3  # horizon for model-based action contrast
-    FC_FEATURE_SPAWN_COOLDOWN = 400  # per-feature cooldown between spawned options
-    FC_OPTION_PRUNE_WINDOW = 500  # steps to evaluate option performance
-    FC_OPTION_SUCCESS_THRESHOLD = 0.10  # min success rate to keep option
-    FC_OPTION_PRUNE_RECENT_STARTS = 5  # min recent executions before windowed pruning
+    FC_FEATURE_SPAWN_COOLDOWN = 300  # Lower cooldown for faster option creation
+    FC_OPTION_PRUNE_WINDOW = 800  # Longer window for pruning evaluation
+    FC_OPTION_SUCCESS_THRESHOLD = 0.05  # Lower threshold to keep options longer
+    FC_OPTION_PRUNE_RECENT_STARTS = 3  # Lower requirement for recent usage
+    FC_OPTION_PRUNE_MIN_AGE_STEPS = 2500  # Longer runway before pruning
+    FC_OPTION_MIN_EXECUTIONS = 15  # Lower minimum executions
     FC_SURVIVAL_TARGET = 200.0
     FC_USAGE_WINDOW = 5  # episodes for option usage summaries
 
-    # Replay Buffers
+    # Experience Buffers (OaK-compliant: small recency windows, not replay)
     REPLAY_CAPACITY = 100000
-    REPLAY_REAL_CAPACITY = 50000
-    REPLAY_SIM_CAPACITY = 50000
+    REPLAY_REAL_CAPACITY = 5000  # Reduced to recency window
+    REPLAY_SIM_CAPACITY = 2000  # Reduced - primarily use on-demand generation
+    OAK_PURITY_MODE = True  # If True, use streaming + on-demand model sampling
 
     # Training
     NUM_EPISODES = 1000
     MAX_STEPS_PER_EPISODE = 500
     EVAL_FREQ = 10  # episodes
     EVAL_EPISODES = 100
+    EVAL_EPISODES_FINAL = 500  # Longer final evaluation for robustness
     TARGET_RETURN = 475.0  # CartPole solving threshold
+    TARGET_RETURN_STRICT = 495.0  # More stringent threshold (99% success)
 
     # Exploration
     EPSILON_START = 1.0
-    EPSILON_END = 0.01
-    EPSILON_DECAY = 0.995
+    EPSILON_END = 0.05  # Higher floor to maintain exploration
+    EPSILON_DECAY = 0.998  # Slower decay for continual exploration
 
     # Logging
     LOG_FREQ = 1  # episodes

@@ -15,6 +15,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
 
+from meta.meta_optimizer import MetaOptimizerAdapter
+
 class GVF(nn.Module):
     """
     Base Generalized Value Function
@@ -26,6 +28,7 @@ class GVF(nn.Module):
         self.state_dim = state_dim
         self.gamma = gamma
         self.use_idbd = use_idbd
+        self.base_lr = 1e-3
 
         # Function approximator (small MLP)
         self.net = nn.Sequential(
@@ -58,6 +61,13 @@ class GVF(nn.Module):
         self._target_m2 = 0.0
         self._target_count = 0
 
+        self.optimizer = None
+
+    def configure_optimizer(self, base_lr=1e-3, meta_config=None):
+        """Attach optimizer/meta-optimizer for GD updates."""
+        self.base_lr = base_lr
+        self.optimizer = MetaOptimizerAdapter(self.net.parameters(), base_lr=base_lr, meta_config=meta_config)
+
     def predict(self, state):
         """Predict value for given state"""
         if isinstance(state, np.ndarray):
@@ -74,6 +84,11 @@ class GVF(nn.Module):
         if not np.isfinite(result).all() if isinstance(result, np.ndarray) else not np.isfinite(result):
             return 0.0
 
+        # Normalize by theoretical max: cumulant_max / (1 - gamma)
+        # For normalized cumulants in [0,1], max prediction = 1/(1-gamma)
+        normalization_factor = 1.0 / max(1.0 - self.gamma, 0.01)  # avoid div by zero
+        result = result / normalization_factor
+
         return result
 
     def forward(self, state):
@@ -83,7 +98,8 @@ class GVF(nn.Module):
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
-        return self.net(state).squeeze(-1)
+        prediction = self.net(state).squeeze(-1)
+        return torch.clamp(prediction, -5.0, 5.0)
 
     def compute_td_error(self, state, cumulant, next_state, gamma=None):
         """
@@ -117,29 +133,30 @@ class GVF(nn.Module):
         loss = td_error.pow(2).mean()
 
         # Backward pass
-        self.net.zero_grad()
+        self.net.zero_grad(set_to_none=True)
+        if self.optimizer is not None:
+            self.optimizer.zero_grad()
         loss.backward()
 
-        # Clip gradients for stability
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        # Clip gradients for stability (relaxed to track non-stationary targets)
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.5)
 
-        # Apply gradient (with optional custom step-size from IDBD)
+        # Apply gradient (with optional custom step-size override)
         if step_size is not None:
-            # Bound step-size to prevent explosion
             step_size = np.clip(step_size, 1e-6, 0.1)
             with torch.no_grad():
                 for param in self.net.parameters():
                     if param.grad is not None:
                         param.data -= step_size * param.grad
-                        # Clamp weights to prevent overflow
                         param.data.clamp_(-10.0, 10.0)
+        elif self.optimizer is not None:
+            feature_vec = self._feature_vector_from_state(state)
+            self.optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
         else:
-            # Use default optimizer
             with torch.no_grad():
                 for param in self.net.parameters():
                     if param.grad is not None:
-                        param.data -= 0.001 * param.grad
-                        # Clamp weights to prevent overflow
+                        param.data -= self.base_lr * param.grad
                         param.data.clamp_(-10.0, 10.0)
 
         # Check for NaN and reset if necessary
@@ -199,6 +216,16 @@ class GVF(nn.Module):
                 nn.init.xavier_uniform_(module.weight, gain=0.01)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _feature_vector_from_state(state):
+        if isinstance(state, torch.Tensor):
+            vector = state.detach().cpu().numpy()
+        else:
+            vector = np.asarray(state, dtype=np.float32)
+        if vector.ndim > 1:
+            vector = vector.reshape(-1)
+        return vector
 
     def get_recent_predictions(self, n=100):
         """Get last n predictions for feature mining"""
@@ -281,8 +308,8 @@ class SurvivalGVF(GVF):
         self.horizon = horizon
 
     def compute_cumulant(self, state):
-        """Cumulant: normalized survival reward (≈1/horizon)."""
-        return 1.0 / self.horizon
+        """Cumulant: 1.0 per step survived (will be normalized by 1/(1-γ) in predict)."""
+        return 1.0
 
 
 class HordeGVFs:
@@ -291,7 +318,7 @@ class HordeGVFs:
     Updates all GVFs in parallel (OaK continual learning)
     """
 
-    def __init__(self, state_dim, config):
+    def __init__(self, state_dim, config, meta_config=None):
         self.state_dim = state_dim
 
         # Create the 4 core GVFs
@@ -308,6 +335,14 @@ class HordeGVFs:
         }
 
         self.config = config
+
+        base_lr = getattr(config, 'GVF_LR', 1e-3)
+        meta_cfg = None
+        if meta_config is not None:
+            meta_cfg = meta_config.copy()
+            meta_cfg['init_log_alpha'] = math.log(base_lr)
+        for gvf in self.gvfs.values():
+            gvf.configure_optimizer(base_lr=base_lr, meta_config=meta_cfg)
 
     def predict_all(self, state):
         """Get predictions from all GVFs"""

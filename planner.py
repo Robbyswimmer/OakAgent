@@ -140,6 +140,7 @@ class DynaPlanner:
             available_options = [
                 option_id
                 for option_id in self.option_library.get_option_ids()
+                if option_id < self.q_option.num_options
                 if self.option_library.can_initiate(option_id, state)
             ]
             if np.random.rand() < 0.5 and available_options:
@@ -156,9 +157,15 @@ class DynaPlanner:
         best_primitive_q = q_primitive_values[best_primitive_action]
 
         # Check option Q-values
-        active_option_ids = self.option_library.get_option_ids()
+        active_option_ids = [
+            option_id
+            for option_id in self.option_library.get_option_ids()
+            if option_id < self.q_option.num_options
+        ]
         if active_option_ids:
             q_option_values = self.q_option.predict(state)
+            if q_option_values.size == 0:
+                return best_primitive_action, False
             initiable_options = [
                 option_id
                 for option_id in active_option_ids
