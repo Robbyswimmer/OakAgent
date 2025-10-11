@@ -148,7 +148,40 @@ class FeatureConstructor:
 
             # Criteria for promising features:
             count = len(predictions)
-            variance = _safe_variance(predictions) if count > 0 else float('nan')
+
+            # Compute variance on DIVERSE sampled states, not just recent trajectory
+            # This breaks chicken-and-egg: poor exploration → similar states → low variance → no options
+            if state_history and len(state_history) >= 20:
+                # Sample 50 diverse states by adding noise to recent states
+                n_samples = min(50, len(state_history))
+                sample_indices = np.random.choice(len(state_history), n_samples, replace=False)
+                base_states = [state_history[i] for i in sample_indices]
+
+                diverse_predictions = []
+                gvf = self.horde.gvfs[gvf_name]
+                for base_state in base_states:
+                    if base_state is None or not np.all(np.isfinite(base_state)):
+                        continue
+                    # Add noise to create state diversity
+                    noise_scale = 0.3  # moderate noise
+                    noisy_state = base_state + np.random.randn(len(base_state)) * noise_scale
+                    # Clip to valid bounds
+                    noisy_state[0] = np.clip(noisy_state[0], -2.4, 2.4)  # x
+                    noisy_state[1] = np.clip(noisy_state[1], -3.0, 3.0)  # x_dot
+                    noisy_state[2] = np.clip(noisy_state[2], -0.21, 0.21)  # theta
+                    noisy_state[3] = np.clip(noisy_state[3], -3.0, 3.0)  # theta_dot
+
+                    pred = gvf.predict(noisy_state)
+                    if np.isfinite(pred):
+                        diverse_predictions.append(pred)
+
+                # Use diverse variance if we got enough samples
+                if len(diverse_predictions) >= 20:
+                    variance = _safe_variance(diverse_predictions)
+                else:
+                    variance = _safe_variance(predictions) if count > 0 else float('nan')
+            else:
+                variance = _safe_variance(predictions) if count > 0 else float('nan')
             variance_threshold = self.config.FC_FEATURE_VARIANCE_THRESHOLD
             relaxed_threshold = getattr(
                 self.config, 'FC_FEATURE_INITIAL_VARIANCE', variance_threshold
@@ -300,8 +333,8 @@ class FeatureConstructor:
         if self.dyn_model is None or not recent_states:
             return 0.0
 
-        # Sample up to 200 states for efficiency
-        n_samples = min(200, len(recent_states))
+        # Sample up to 100 states for efficiency (reduced from 200)
+        n_samples = min(100, len(recent_states))
         if n_samples < 10:
             return 0.0
 
@@ -309,6 +342,8 @@ class FeatureConstructor:
         sampled_states = [recent_states[i] for i in sample_indices]
 
         contrasts = []
+        raw_scores_left = []
+        raw_scores_right = []
 
         for state in sampled_states:
             if state is None or not np.all(np.isfinite(state)):
@@ -321,6 +356,7 @@ class FeatureConstructor:
                 s_sim = np.array(state, dtype=np.float32, copy=True)
                 cumulative_gvf = 0.0
                 discount = 1.0
+                valid_horizon = True
 
                 for h in range(horizon):
                     # One-step model prediction
@@ -330,34 +366,71 @@ class FeatureConstructor:
                     if isinstance(s_next, torch.Tensor):
                         s_next = s_next.squeeze(0).cpu().numpy()
 
+                    # Check for valid state
+                    if not np.all(np.isfinite(s_next)):
+                        valid_horizon = False
+                        break
+
+                    # Early stop if terminal-looking state
+                    if abs(s_next[0]) > 2.4 or abs(s_next[2]) > 0.2095:
+                        valid_horizon = False
+                        break
+
                     # GVF prediction at next state
                     gvf_value = gvf.predict(s_next)
 
                     if not np.isfinite(gvf_value):
+                        valid_horizon = False
                         break
 
+                    # Clip GVF values to reasonable range to prevent instability
+                    gvf_value = np.clip(gvf_value, 0.0, 10.0)
                     cumulative_gvf += discount * gvf_value
                     discount *= 0.9  # decay for multi-step
                     s_sim = s_next
 
-                    # Early stop if terminal-looking state
-                    if abs(s_sim[0]) > 2.4 or abs(s_sim[2]) > 0.2095:
-                        break
-
-                action_scores.append(cumulative_gvf)
+                if valid_horizon:
+                    action_scores.append(cumulative_gvf)
+                    if action == 0:
+                        raw_scores_left.append(cumulative_gvf)
+                    else:
+                        raw_scores_right.append(cumulative_gvf)
 
             # Contrast between actions
             if len(action_scores) == 2:
                 contrast = abs(action_scores[0] - action_scores[1])
                 if np.isfinite(contrast):
-                    contrasts.append(np.clip(contrast, 0.0, 1.5))
+                    contrasts.append(contrast)
 
         if not contrasts:
             return 0.0
 
+        # Use median and robust statistics to reduce outlier impact
         contrasts = np.array(contrasts, dtype=np.float64)
-        score = float(np.tanh(contrasts.mean()))
+
+        # Remove outliers (values > 3 std from median)
+        median_contrast = np.median(contrasts)
+        std_contrast = np.std(contrasts)
+        if std_contrast > 0:
+            mask = np.abs(contrasts - median_contrast) <= 3.0 * std_contrast
+            contrasts = contrasts[mask]
+
+        if len(contrasts) == 0:
+            return 0.0
+
+        # Normalize by typical GVF scale to make contrast meaningful
+        typical_gvf_scale = max(np.mean(raw_scores_left + raw_scores_right), 0.1)
+        normalized_contrast = contrasts.mean() / typical_gvf_scale
+
+        # Apply sigmoid to get score in [0, 1]
+        score = float(np.tanh(normalized_contrast * 2.0))  # scale factor for sensitivity
         score = max(0.0, min(1.0, score))
+
+        # Exponential moving average for temporal smoothing
+        if len(self.controllability_log) > 0:
+            prev_score = self.controllability_log[-1]
+            score = 0.7 * score + 0.3 * prev_score  # smooth with previous
+
         self.controllability_log.append(score)
         return score
 

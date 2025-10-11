@@ -20,7 +20,11 @@ class OptionModel(nn.Module):
         super().__init__()
         self.state_dim = state_dim
 
-        # Shared layers
+        # CartPole state bounds for normalization and clipping
+        # [x, x_dot, theta, theta_dot]
+        self.state_bounds = torch.FloatTensor([2.4, 3.0, 0.21, 3.0])
+
+        # Shared layers with smaller initialization
         self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.ReLU(),
@@ -33,6 +37,17 @@ class OptionModel(nn.Module):
         self.reward_head = nn.Linear(hidden_size, 1)  # Total reward R_o
         self.duration_head = nn.Linear(hidden_size, 1)  # Duration τ
 
+        # Initialize with small weights to prevent initial explosion
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize with small weights to prevent prediction explosion"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def forward(self, state):
         """
         Args:
@@ -44,11 +59,24 @@ class OptionModel(nn.Module):
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
-        features = self.shared(state)
+        # Normalize input state to roughly [-1, 1] range
+        state_normalized = state / self.state_bounds.to(state.device)
 
-        delta_state = self.delta_head(features)
+        features = self.shared(state_normalized)
+
+        # Predict delta in normalized space, then denormalize
+        delta_normalized = self.delta_head(features)
+        # Use tanh for bounded predictions, but scale appropriately for option duration
+        delta_normalized = torch.tanh(delta_normalized)  # constrain to [-1, 1]
+        # Options can move further over multiple steps, so allow larger deltas
+        delta_state = delta_normalized * self.state_bounds.to(state.device) * 1.5  # increased from 0.5
+
+        # Reward prediction (don't clip - learn true rewards)
         total_reward = self.reward_head(features)
+
+        # Duration prediction with reasonable bounds
         duration = F.softplus(self.duration_head(features)) + 1.0  # ensure τ >= 1
+        duration = torch.clamp(duration, 1.0, 20.0)
 
         return delta_state, total_reward, duration
 
@@ -61,10 +89,15 @@ class OptionModel(nn.Module):
             delta_s, R, tau = self.forward(state)
             next_state = state + delta_s
 
+            # Clip next state to reasonable bounds
+            state_bounds_np = self.state_bounds.cpu().numpy()
+            next_state_np = next_state.squeeze().cpu().numpy()
+            next_state_np = np.clip(next_state_np, -state_bounds_np, state_bounds_np)
+
             return (
-                next_state.squeeze().cpu().numpy(),
+                next_state_np,
                 R.squeeze().item(),
-                int(tau.squeeze().item())
+                int(np.clip(tau.squeeze().item(), 1, 20))
             )
 
 
@@ -150,24 +183,35 @@ class OptionModelLibrary:
             s_start = s_start.unsqueeze(0)
             s_end = s_end.unsqueeze(0)
 
-        # Target values
+        # Target values (use TRUE transitions, don't clip)
         target_delta = s_end - s_start
         target_reward = torch.FloatTensor([[R_total]])
         target_duration = torch.FloatTensor([[duration]])
 
+        # Only clip duration to reasonable bounds (rewards and deltas should be learned as-is)
+        target_duration = torch.clamp(target_duration, 1.0, 20.0)
+
         # Forward pass
         pred_delta, pred_reward, pred_duration = model(s_start)
 
-        # Loss
-        loss_delta = F.mse_loss(pred_delta, target_delta)
-        loss_reward = F.mse_loss(pred_reward, target_reward)
-        loss_duration = F.mse_loss(pred_duration, target_duration)
-        loss = loss_delta + loss_reward + 0.1 * loss_duration  # weight duration less
+        # Normalize deltas by state bounds for balanced loss across dimensions
+        # Without this, position errors dominate and angle errors (most critical!) are ignored
+        state_bounds_tensor = model.state_bounds.unsqueeze(0).to(s_start.device)
+        pred_delta_normalized = pred_delta / state_bounds_tensor
+        target_delta_normalized = target_delta / state_bounds_tensor
+
+        # Loss with normalized state dimensions
+        loss_delta = F.mse_loss(pred_delta_normalized, target_delta_normalized)
+        loss_reward = F.mse_loss(pred_reward, target_reward) / 100.0  # normalize rewards to ~0-1 scale
+        loss_duration = F.mse_loss(pred_duration, target_duration) / 20.0  # normalize duration to ~0-1 scale
+
+        # Balanced loss across all components (now all roughly same scale)
+        loss = loss_delta + loss_reward + loss_duration
 
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # tighter clipping
 
         feature_vec = s_start.detach().cpu().numpy().reshape(-1)
         optimizer.step(feature_vec, clip_range=(-10.0, 10.0))

@@ -38,14 +38,23 @@ class UprightOption(Option):
             return theta < -self.theta_threshold * 0.5
 
     def compute_pseudo_reward(self, state):
-        """Pseudo-reward: negative angle magnitude (want to minimize)"""
+        """Pseudo-reward: shaped to encourage reducing theta magnitude"""
         theta = state[2]
-        reward = -abs(theta)
+        # Exponential shaping: reward is higher when closer to goal
+        distance = abs(theta) / self.theta_threshold
+        reward = np.exp(-2.0 * distance) - 1.0  # in [-1, 0] range
+
+        # Bonus for being very close to goal
+        if abs(theta) < self.theta_threshold:
+            reward += 1.0
+
+        # Penalty for moving away from preferred direction
         if self.preferred_direction is not None:
             same_direction = self.preferred_direction * theta
             if same_direction > 0:
-                reward -= 0.1 * same_direction
-        return reward
+                reward -= 0.2 * min(same_direction, 1.0)
+
+        return reward * 5.0  # scale for stronger signal
 
 
 class CenteringOption(Option):
@@ -63,9 +72,16 @@ class CenteringOption(Option):
         return achieved, achieved
 
     def compute_pseudo_reward(self, state):
-        """Pseudo-reward: negative position magnitude"""
+        """Pseudo-reward: shaped to encourage centering"""
         x = state[0]
-        return -abs(x)
+        distance = abs(x) / self.x_threshold
+        reward = np.exp(-2.0 * distance) - 1.0
+
+        # Bonus for being centered
+        if abs(x) < self.x_threshold:
+            reward += 1.0
+
+        return reward * 5.0
 
 
 class StabilizeOption(Option):
@@ -85,10 +101,18 @@ class StabilizeOption(Option):
         return achieved, achieved
 
     def compute_pseudo_reward(self, state):
-        """Pseudo-reward: negative velocity magnitude"""
+        """Pseudo-reward: shaped to encourage stability"""
         x_dot = state[1]
         theta_dot = state[3]
-        return -(abs(x_dot) + abs(theta_dot))
+        velocity_magnitude = abs(x_dot) + abs(theta_dot)
+        distance = velocity_magnitude / self.velocity_threshold
+        reward = np.exp(-2.0 * distance) - 1.0
+
+        # Bonus for being stable
+        if velocity_magnitude < self.velocity_threshold:
+            reward += 1.0
+
+        return reward * 5.0
 
 
 class BalanceOption(Option):
@@ -112,10 +136,22 @@ class BalanceOption(Option):
         return achieved, achieved
 
     def compute_pseudo_reward(self, state):
-        """Pseudo-reward: combined distance from goal"""
+        """Pseudo-reward: shaped combined goal"""
         x = state[0]
         theta = state[2]
-        return -(abs(theta) + abs(x))
+
+        # Distance to goal in each dimension
+        theta_dist = abs(theta) / self.theta_threshold
+        x_dist = abs(x) / self.x_threshold
+
+        # Combined exponential shaping
+        reward = np.exp(-2.0 * (theta_dist + x_dist)) - 1.0
+
+        # Bonus for achieving goal
+        if abs(theta) < self.theta_threshold and abs(x) < self.x_threshold:
+            reward += 2.0
+
+        return reward * 5.0
 
 
 class OptionLibrary:

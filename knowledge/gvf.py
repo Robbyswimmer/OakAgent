@@ -84,6 +84,11 @@ class GVF(nn.Module):
         if not np.isfinite(result).all() if isinstance(result, np.ndarray) else not np.isfinite(result):
             return 0.0
 
+        # Normalize by theoretical max: cumulant_max / (1 - gamma)
+        # For normalized cumulants in [0,1], max prediction = 1/(1-gamma)
+        normalization_factor = 1.0 / max(1.0 - self.gamma, 0.01)  # avoid div by zero
+        result = result / normalization_factor
+
         return result
 
     def forward(self, state):
@@ -133,8 +138,8 @@ class GVF(nn.Module):
             self.optimizer.zero_grad()
         loss.backward()
 
-        # Clip gradients for stability
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        # Clip gradients for stability (relaxed to track non-stationary targets)
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.5)
 
         # Apply gradient (with optional custom step-size override)
         if step_size is not None:
@@ -303,8 +308,8 @@ class SurvivalGVF(GVF):
         self.horizon = horizon
 
     def compute_cumulant(self, state):
-        """Cumulant: normalized survival reward (≈1/horizon)."""
-        return 1.0 / self.horizon
+        """Cumulant: 1.0 per step survived (will be normalized by 1/(1-γ) in predict)."""
+        return 1.0
 
 
 class HordeGVFs:
