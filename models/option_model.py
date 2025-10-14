@@ -20,9 +20,7 @@ class OptionModel(nn.Module):
         super().__init__()
         self.state_dim = state_dim
 
-        # CartPole state bounds for normalization and clipping
-        # [x, x_dot, theta, theta_dot]
-        self.state_bounds = torch.FloatTensor([2.4, 3.0, 0.21, 3.0])
+        self.state_bounds = None  # set dynamically based on environment
 
         # Shared layers with smaller initialization
         self.shared = nn.Sequential(
@@ -59,8 +57,12 @@ class OptionModel(nn.Module):
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
-        # Normalize input state to roughly [-1, 1] range
-        state_normalized = state / self.state_bounds.to(state.device)
+        state_normalized = state
+        if self.state_bounds is not None:
+            bounds = self.state_bounds.to(state.device)
+            bounds = bounds.expand_as(state)
+            bounds = torch.where(bounds != 0, bounds, torch.ones_like(bounds))
+            state_normalized = state_normalized / bounds
 
         features = self.shared(state_normalized)
 
@@ -68,8 +70,13 @@ class OptionModel(nn.Module):
         delta_normalized = self.delta_head(features)
         # Use tanh for bounded predictions, but scale appropriately for option duration
         delta_normalized = torch.tanh(delta_normalized)  # constrain to [-1, 1]
-        # Options can move further over multiple steps, so allow larger deltas
-        delta_state = delta_normalized * self.state_bounds.to(state.device) * 1.5  # increased from 0.5
+        if self.state_bounds is not None:
+            bounds = self.state_bounds.to(state.device)
+            bounds = bounds.expand_as(delta_normalized)
+            bounds = torch.where(bounds != 0, bounds, torch.ones_like(bounds))
+            delta_state = delta_normalized * bounds * 1.5
+        else:
+            delta_state = delta_normalized
 
         # Reward prediction (don't clip - learn true rewards)
         total_reward = self.reward_head(features)
@@ -131,6 +138,11 @@ class OptionModelLibrary:
     def add_option(self, option_id):
         """Add a new option model"""
         model = OptionModel(self.state_dim, self.hidden_size)
+        if self.state_dim <= 4:
+            # Default bounds suitable for CartPole-like state vectors
+            model.state_bounds = torch.FloatTensor([2.4, 3.0, 0.21, 3.0])
+        else:
+            model.state_bounds = None  # Unbounded for high-dimensional states like ARC
         optimizer = MetaOptimizerAdapter(model.parameters(), base_lr=self.lr, meta_config=self.meta_config)
         self.models[option_id] = (model, optimizer)
         self.prediction_errors[option_id] = []
@@ -196,9 +208,14 @@ class OptionModelLibrary:
 
         # Normalize deltas by state bounds for balanced loss across dimensions
         # Without this, position errors dominate and angle errors (most critical!) are ignored
-        state_bounds_tensor = model.state_bounds.unsqueeze(0).to(s_start.device)
-        pred_delta_normalized = pred_delta / state_bounds_tensor
-        target_delta_normalized = target_delta / state_bounds_tensor
+        if model.state_bounds is not None:
+            state_bounds_tensor = model.state_bounds.unsqueeze(0).to(s_start.device)
+            state_bounds_tensor = torch.where(state_bounds_tensor != 0, state_bounds_tensor, torch.ones_like(state_bounds_tensor))
+            pred_delta_normalized = pred_delta / state_bounds_tensor
+            target_delta_normalized = target_delta / state_bounds_tensor
+        else:
+            pred_delta_normalized = pred_delta
+            target_delta_normalized = target_delta
 
         # Loss with normalized state dimensions
         loss_delta = F.mse_loss(pred_delta_normalized, target_delta_normalized)

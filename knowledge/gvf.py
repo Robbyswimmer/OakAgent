@@ -2,11 +2,15 @@
 Generalized Value Functions (GVFs) - Knowledge Layer
 Predictive knowledge as learned GVFs (OaK core principle #2)
 
-Each GVF predicts a specific cumulant under a policy:
-- g1: E[|theta|] - uprightness predictor
-- g2: E[|x|] - centering predictor
-- g3: E[|theta_dot| + |x_dot|] - stability predictor
-- g4: E[time-to-failure] - survival horizon predictor
+This module provides the generic GVF base class.
+Environment-specific GVF implementations should inherit from this class
+and implement the compute_cumulant() method.
+
+Example (CartPole):
+    See environments/cartpole/gvfs.py for UprignessGVF, CenteringGVF, etc.
+
+Example (ARC):
+    See environments/arc/gvfs.py for GridSimilarityGVF, EntropyGVF, etc.
 """
 import math
 import numpy as np
@@ -21,6 +25,9 @@ class GVF(nn.Module):
     """
     Base Generalized Value Function
     Learns to predict E[cumulant] using TD learning
+
+    Subclasses must implement:
+        compute_cumulant(state) -> float: Returns the cumulant value for the given state
     """
 
     def __init__(self, state_dim, hidden_size=64, gamma=0.97, use_idbd=True):
@@ -244,168 +251,21 @@ class GVF(nn.Module):
             return 0.0
         return float(np.mean(list(self.normalized_error_history)))
 
-
-class UprignessGVF(GVF):
-    """g1: Predicts E[|theta|] - how upright the pole is"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "uprightness"
-        self.theta_max = 0.2095  # ~12 degrees (CartPole termination threshold)
-
     def compute_cumulant(self, state):
-        """Cumulant: normalized |theta| ∈ [0, 1]"""
-        if isinstance(state, np.ndarray):
-            theta = state[2]  # theta is 3rd component
-        else:
-            theta = state[..., 2]
-        return abs(theta) / self.theta_max
-
-
-class CenteringGVF(GVF):
-    """g2: Predicts E[|x|] - how centered the cart is"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "centering"
-        self.x_max = 2.4  # CartPole termination threshold
-
-    def compute_cumulant(self, state):
-        """Cumulant: normalized |x| ∈ [0, 1]"""
-        if isinstance(state, np.ndarray):
-            x = state[0]  # x is 1st component
-        else:
-            x = state[..., 0]
-        return abs(x) / self.x_max
-
-
-class StabilityGVF(GVF):
-    """g3: Predicts E[|theta_dot| + |x_dot|] - velocity stability"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "stability"
-        self.velocity_scale = 5.0  # Empirical max for |theta_dot| + |x_dot|
-
-    def compute_cumulant(self, state):
-        """Cumulant: normalized velocity magnitude ∈ [0, 1]"""
-        if isinstance(state, np.ndarray):
-            x_dot = state[1]
-            theta_dot = state[3]
-        else:
-            x_dot = state[..., 1]
-            theta_dot = state[..., 3]
-        total_velocity = abs(theta_dot) + abs(x_dot)
-        return min(total_velocity / self.velocity_scale, 1.0)
-
-
-class SurvivalGVF(GVF):
-    """g4: Predicts E[time-to-failure] - survival horizon"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.99, horizon=200.0):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "survival"
-        self.horizon = horizon
-
-    def compute_cumulant(self, state):
-        """Cumulant: 1.0 per step survived (will be normalized by 1/(1-γ) in predict)."""
-        return 1.0
-
-
-class HordeGVFs:
-    """
-    Horde of GVFs - collection of all predictive knowledge
-    Updates all GVFs in parallel (OaK continual learning)
-    """
-
-    def __init__(self, state_dim, config, meta_config=None):
-        self.state_dim = state_dim
-
-        # Create the 4 core GVFs
-        self.gvfs = {
-            'uprightness': UprignessGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'centering': CenteringGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'stability': StabilityGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'survival': SurvivalGVF(
-                state_dim,
-                config.GVF_HIDDEN_SIZE,
-                config.GVF_GAMMA_LONG,
-                horizon=getattr(config, 'FC_SURVIVAL_TARGET', 200.0),
-            ),
-        }
-
-        self.config = config
-
-        base_lr = getattr(config, 'GVF_LR', 1e-3)
-        meta_cfg = None
-        if meta_config is not None:
-            meta_cfg = meta_config.copy()
-            meta_cfg['init_log_alpha'] = math.log(base_lr)
-        for gvf in self.gvfs.values():
-            gvf.configure_optimizer(base_lr=base_lr, meta_config=meta_cfg)
-
-    def predict_all(self, state):
-        """Get predictions from all GVFs"""
-        predictions = {}
-        for name, gvf in self.gvfs.items():
-            predictions[name] = gvf.predict(state)
-        return predictions
-
-    def update_all(self, state, next_state, done, step_sizes=None):
         """
-        Update all GVFs with their respective cumulants
-        (continual learning - called every step)
+        Compute the cumulant for this GVF.
+        Must be implemented by subclasses.
 
-        Returns: dict of td_errors for meta-learning
+        Args:
+            state: Environment state (numpy array or torch tensor)
+
+        Returns:
+            cumulant: Scalar value representing the cumulant
+
+        Example (CartPole uprightness):
+            return abs(state[2]) / 0.2095  # |theta| normalized
+
+        Example (ARC grid similarity):
+            return np.mean(current_grid == solution_grid)
         """
-        td_errors = {}
-
-        for name, gvf in self.gvfs.items():
-            # Compute cumulant for this GVF
-            cumulant = gvf.compute_cumulant(state)
-
-            # Get step-size from IDBD if provided
-            step_size = step_sizes.get(name) if step_sizes else None
-
-            # Update GVF
-            gamma = 0.0 if done else gvf.gamma
-            td_error = gvf.update(state, cumulant, next_state, gamma=gamma, step_size=step_size)
-            td_errors[name] = td_error
-
-        return td_errors
-
-    def get_feature_vector(self, state):
-        """
-        Get feature vector from GVF predictions
-        This is the "knowledge" that drives option formation
-        """
-        predictions = self.predict_all(state)
-        return np.array([predictions['uprightness'],
-                        predictions['centering'],
-                        predictions['stability'],
-                        predictions['survival']])
-
-    def get_prediction_histories(self):
-        """Get recent predictions from all GVFs for feature mining"""
-        histories = {}
-        for name, gvf in self.gvfs.items():
-            histories[name] = gvf.get_recent_predictions()
-        return histories
-
-    def get_average_errors(self):
-        """Get average prediction errors for all GVFs"""
-        errors = {}
-        for name, gvf in self.gvfs.items():
-            errors[name] = gvf.get_average_error()
-        return errors
-
-    def get_normalized_errors(self):
-        """Get normalized TD errors for all GVFs."""
-        normalized = {}
-        for name, gvf in self.gvfs.items():
-            normalized[name] = gvf.get_normalized_error()
-        return normalized
-
-    def __getitem__(self, name):
-        """Access GVF by name"""
-        return self.gvfs[name]
+        raise NotImplementedError("Subclasses must implement compute_cumulant()")

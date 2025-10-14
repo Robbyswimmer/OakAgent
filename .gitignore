@@ -14,6 +14,7 @@ __pycache__/
 
 # Results and Logs
 results/
+continual_results/
 logs/
 *.log
 

@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import deque
 
 from meta.meta_optimizer import MetaOptimizerAdapter
 
@@ -70,6 +71,9 @@ class Option:
         self.success_count = 0
         self.total_duration = 0
         self.creation_step = 0
+
+        # Windowed tracking for continual learning (Fix #2)
+        self.recent_executions = deque(maxlen=50)  # Track last 50 executions (success/failure)
 
         # Value function for intra-option learning (optional)
         self.value_net = nn.Sequential(
@@ -276,6 +280,9 @@ class Option:
         if success:
             self.success_count += 1
 
+        # Windowed tracking for continual learning (Fix #2)
+        self.recent_executions.append(1 if success else 0)
+
         return trajectory, success
 
     def get_statistics(self):
@@ -292,3 +299,22 @@ class Option:
             'success_rate': self.success_count / self.execution_count,
             'avg_duration_steps': self.total_duration / self.execution_count
         }
+
+    def get_recent_success_rate(self, window=None):
+        """
+        Get success rate over recent executions (Fix #2: continual learning)
+
+        Args:
+            window: Number of recent executions to consider (default: use deque maxlen)
+
+        Returns:
+            Success rate (0.0 to 1.0) or None if insufficient data
+        """
+        if len(self.recent_executions) == 0:
+            return None
+
+        if window is not None and window < len(self.recent_executions):
+            recent_subset = list(self.recent_executions)[-window:]
+            return sum(recent_subset) / len(recent_subset)
+
+        return sum(self.recent_executions) / len(self.recent_executions)
