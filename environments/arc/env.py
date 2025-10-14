@@ -1,9 +1,9 @@
 """
 ARC (Abstract Reasoning Challenge) Environment for OaK Framework
 
-State representation: Flattened grid + task context embeddings
-Action space: Object-level transformations (discrete actions)
-Reward: Sparse (1.0 for correct solution, 0.0 otherwise)
+State representation: Flattened grid + exemplar embeddings + spatial features
+Action space: Structured object-level transformations (paint, fill, copy, rotate, submit)
+Reward: Dense shaping on match ratio with bonus for correct submissions
 
 ARC tasks are grid transformation puzzles where the agent must:
 1. Observe training example pairs (input → output)
@@ -29,18 +29,14 @@ class ARCEnvironment(OaKEnvironment):
     # ARC color palette (0-9)
     NUM_COLORS = 10
     MAX_GRID_SIZE = 30  # ARC grids can be up to 30x30
+    MAX_TRAINING_EXAMPLES = 3  # ARC typically ships <=3 exemplars
 
-    # Action space: Object-level operations
-    # Format: (operation_type, param1, param2, ...)
-    ACTION_TYPES = {
-        0: 'set_cell',        # Set cell at (x, y) to color
-        1: 'fill_region',     # Fill connected region with color
-        2: 'copy_pattern',    # Copy pattern from one location to another
-        3: 'rotate_pattern',  # Rotate pattern 90/180/270 degrees
-        4: 'mirror_h',        # Horizontal mirror
-        5: 'mirror_v',        # Vertical mirror
-        6: 'submit',          # Submit current grid as solution
-    }
+    # Parameters that control how many structured actions we expose.
+    # Keeping them relatively small still gives us far richer behaviour
+    # than the original "flip a single cell" space while remaining tractable
+    # for small-scale experiments.
+    COPY_PATCH_SIZE = 3
+    COPY_PATCH_STRIDE = 3
 
     def __init__(self, task_path: Optional[str] = None, max_steps: int = 50):
         """
@@ -63,22 +59,41 @@ class ARCEnvironment(OaKEnvironment):
         # Current episode state
         self.current_grid = None
         self.steps_taken = 0
+        self.prev_match_ratio = 0.0
 
         # Grid dimensions (set when task is loaded)
         self.grid_height = 0
         self.grid_width = 0
 
+        # Cached task embedding (built from exemplars)
+        self._task_feature_dim = (
+            self.MAX_TRAINING_EXAMPLES * (2 * self.NUM_COLORS + 3)
+        )
+        self._cached_task_features = np.zeros(self._task_feature_dim, dtype=np.float32)
+
+        # Derived feature sizes
+        self._grid_flat_dim = self.MAX_GRID_SIZE * self.MAX_GRID_SIZE
+        self._spatial_feature_dim = len(
+            self._extract_spatial_features(np.zeros((1, 1), dtype=np.float32))
+        )
+        # Context terms: height, width, exemplar count, steps remaining, match ratio
+        self._context_dim = 5
+
+        # State dimension: flattened grid + spatial backbone + task context + metadata
+        self._state_dim = (
+            self._grid_flat_dim
+            + self._spatial_feature_dim
+            + self._task_feature_dim
+            + self._context_dim
+        )
+
+        # Action table populated once the task dimensions are known
+        self._action_table = []
+        self._action_dim = 0
+
         # Load task if path provided
         if task_path:
             self.load_task(task_path)
-
-        # State dimension: flattened grid + task context
-        # Task context: grid_height, grid_width, num_training_examples
-        self._state_dim = self.MAX_GRID_SIZE * self.MAX_GRID_SIZE + 3
-
-        # Action dimension: For now, simplified discrete actions
-        # Each action modifies a cell or region
-        self._action_dim = 100  # Simplified: 10x10 grid positions
 
     @property
     def state_dim(self) -> int:
@@ -86,6 +101,8 @@ class ARCEnvironment(OaKEnvironment):
 
     @property
     def action_dim(self) -> int:
+        if not self._action_table:
+            self._rebuild_action_table()
         return self._action_dim
 
     def load_task(self, task_path: str):
@@ -115,6 +132,12 @@ class ARCEnvironment(OaKEnvironment):
         # Set grid dimensions from test input
         self.grid_height, self.grid_width = self.test_input.shape
 
+        # Pre-compute exemplar embedding for richer task conditioning
+        self._cached_task_features = self._compute_task_context_features()
+
+        # Rebuild the structured action table now that we know task dimensions
+        self._rebuild_action_table()
+
         print(f"Loaded ARC task: {Path(task_path).name}")
         print(f"  Training examples: {len(self.training_examples)}")
         print(f"  Grid size: {self.grid_height}x{self.grid_width}")
@@ -127,9 +150,13 @@ class ARCEnvironment(OaKEnvironment):
         if self.test_input is None:
             raise RuntimeError("No task loaded. Call load_task() first.")
 
+        # Rebuild action table in case caller changed task data manually
+        self._rebuild_action_table()
+
         # Start with a copy of test input
         self.current_grid = self.test_input.copy()
         self.steps_taken = 0
+        self.prev_match_ratio = self._compute_match_ratio()
 
         # Create state observation
         self.current_state = self._create_state_observation()
@@ -151,32 +178,65 @@ class ARCEnvironment(OaKEnvironment):
         """
         self.steps_taken += 1
 
-        # Decode action (simplified: action is grid position to flip color)
-        # For now, simple action space: flip cell color at position
-        row = action // 10
-        col = action % 10
+        # Guard against stale action tables (e.g. before load_task())
+        if not self._action_table:
+            self._rebuild_action_table()
 
-        # Ensure action is within grid bounds
-        if row < self.grid_height and col < self.grid_width:
-            # Flip cell color (cycle through colors)
-            self.current_grid[row, col] = (self.current_grid[row, col] + 1) % self.NUM_COLORS
+        # Clip invalid actions
+        action = int(np.clip(action, 0, len(self._action_table) - 1))
 
-        # Check if solution is correct
-        done = False
+        spec = self._action_table[action]
+        prev_match = self._compute_match_ratio()
+
         reward = 0.0
+        done = False
 
-        if self._is_solution_correct():
-            reward = 1.0
+        op_type = spec['type']
+
+        if op_type == 'paint_cell':
+            self._apply_paint_cell(spec)
+        elif op_type == 'fill_region':
+            self._apply_fill_region(spec)
+        elif op_type == 'copy_patch':
+            self._apply_copy_patch(spec)
+        elif op_type == 'mirror':
+            self._apply_mirror(spec)
+        elif op_type == 'rotate':
+            self._apply_rotate(spec)
+        elif op_type == 'submit':
             done = True
-        elif self.steps_taken >= self.max_steps:
+        else:
+            raise ValueError(f"Unknown action spec: {spec}")
+
+        # Match-based shaping before termination logic so submit respects accuracy
+        new_match = self._compute_match_ratio()
+        match_gain = new_match - prev_match
+
+        reward += match_gain * 5.0  # dense shaping encourages gradual progress
+
+        if op_type == 'submit':
+            if self._is_solution_correct():
+                reward += 1.0
+            else:
+                # Mild penalty for premature submission to encourage patience
+                reward -= 0.1
+        elif self._is_solution_correct():
+            reward += 1.0
             done = True
+
+        if self.steps_taken >= self.max_steps and not done:
+            done = True
+
+        self.prev_match_ratio = new_match
 
         # Update state
         self.current_state = self._create_state_observation()
 
         info = {
             'steps_taken': self.steps_taken,
-            'grid_match_ratio': self._compute_match_ratio(),
+            'grid_match_ratio': new_match,
+            'match_gain': match_gain,
+            'action_type': op_type,
         }
 
         return self.current_state.copy(), reward, done, info
@@ -189,19 +249,26 @@ class ARCEnvironment(OaKEnvironment):
             state: Flattened state vector
         """
         # Flatten current grid to MAX_GRID_SIZE x MAX_GRID_SIZE (pad with zeros)
-        flat_grid = np.zeros((self.MAX_GRID_SIZE, self.MAX_GRID_SIZE))
-        flat_grid[:self.grid_height, :self.grid_width] = self.current_grid
+        flat_grid = np.zeros((self.MAX_GRID_SIZE, self.MAX_GRID_SIZE), dtype=np.float32)
+        normalized_grid = self.current_grid.astype(np.float32) / (self.NUM_COLORS - 1)
+        flat_grid[:self.grid_height, :self.grid_width] = normalized_grid
         flat_grid = flat_grid.flatten()
 
-        # Task context features
+        spatial_features = self._extract_spatial_features(normalized_grid)
+        task_features = self._cached_task_features
+
+        # Metadata context (normalized for stability)
         context = np.array([
             self.grid_height / self.MAX_GRID_SIZE,
             self.grid_width / self.MAX_GRID_SIZE,
-            len(self.training_examples) / 10.0,  # Normalize
-        ])
+            min(len(self.training_examples), self.MAX_TRAINING_EXAMPLES)
+            / self.MAX_TRAINING_EXAMPLES,
+            1.0 - (self.steps_taken / max(1, self.max_steps)),
+            self.prev_match_ratio,
+        ], dtype=np.float32)
 
         # Concatenate
-        state = np.concatenate([flat_grid, context])
+        state = np.concatenate([flat_grid, spatial_features, task_features, context])
         return state.astype(np.float32)
 
     def _is_solution_correct(self) -> bool:
@@ -228,6 +295,245 @@ class ARCEnvironment(OaKEnvironment):
             total = self.solution_grid.size
         return matches / total
 
+    def _compute_task_context_features(self) -> np.ndarray:
+        """Encode training exemplars into a fixed-size embedding.
+
+        The encoding captures color distributions and coarse structural
+        properties for up to ``MAX_TRAINING_EXAMPLES`` exemplar pairs. This
+        gives the policy and option models a task-conditioned signal instead of
+        averaging over unrelated puzzles.
+        """
+
+        features: List[float] = []
+        for idx in range(self.MAX_TRAINING_EXAMPLES):
+            if idx < len(self.training_examples):
+                input_grid, output_grid = self.training_examples[idx]
+                features.extend(self._summarize_grid(input_grid))
+                features.extend(self._summarize_grid(output_grid))
+                features.append(self._grid_histogram_distance(input_grid, output_grid))
+                features.append(input_grid.shape[0] / self.MAX_GRID_SIZE)
+                features.append(input_grid.shape[1] / self.MAX_GRID_SIZE)
+            else:
+                features.extend([0.0] * (2 * self.NUM_COLORS + 3))
+
+        return np.array(features, dtype=np.float32)
+
+    def _summarize_grid(self, grid: np.ndarray) -> List[float]:
+        """Return normalized color histogram for a grid."""
+
+        counts = np.bincount(grid.flatten(), minlength=self.NUM_COLORS).astype(np.float32)
+        histogram = counts / max(1.0, counts.sum())
+        return histogram.tolist()
+
+    def _grid_histogram_distance(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute L1 distance between two color histograms."""
+
+        hist_a = np.bincount(a.flatten(), minlength=self.NUM_COLORS).astype(np.float32)
+        hist_b = np.bincount(b.flatten(), minlength=self.NUM_COLORS).astype(np.float32)
+        hist_a /= max(1.0, hist_a.sum())
+        hist_b /= max(1.0, hist_b.sum())
+        return float(np.abs(hist_a - hist_b).sum())
+
+    def _extract_spatial_features(self, grid: np.ndarray) -> np.ndarray:
+        """Simple handcrafted spatial backbone.
+
+        We avoid heavy ML frameworks so the feature extractor is implemented in
+        NumPy. It applies a bank of small convolutional filters and records
+        global statistics. This gives downstream models access to local
+        structure (edges, blobs) that is completely missing when using only the
+        flattened grid.
+        """
+
+        if grid.size == 0:
+            dim = getattr(self, '_spatial_feature_dim', 19)
+            return np.zeros(dim, dtype=np.float32)
+
+        kernels = [
+            np.array([[1, 0, -1], [1, 0, -1], [1, 0, -1]], dtype=np.float32),  # vertical edge
+            np.array([[1, 1, 1], [0, 0, 0], [-1, -1, -1]], dtype=np.float32),  # horizontal edge
+            np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=np.float32),  # laplacian
+            np.ones((3, 3), dtype=np.float32) / 9.0,  # smoothing / blob detector
+        ]
+
+        feats: List[float] = []
+        padded = np.pad(grid, 1, mode='edge')
+
+        for kernel in kernels:
+            conv = self._convolve_valid(padded, kernel)
+            feats.append(conv.mean())
+            feats.append(np.abs(conv).mean())
+            feats.append(conv.max())
+            feats.append(conv.min())
+
+        # Global summary statistics
+        feats.append(grid.mean())
+        feats.append(grid.std())
+        feats.append(float(np.count_nonzero(grid >= 0.5)) / grid.size)
+
+        return np.array(feats, dtype=np.float32)
+
+    def _convolve_valid(self, padded: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+        """Perform a valid convolution of ``kernel`` over ``padded``."""
+
+        kh, kw = kernel.shape
+        out_h = padded.shape[0] - kh + 1
+        out_w = padded.shape[1] - kw + 1
+        output = np.zeros((out_h, out_w), dtype=np.float32)
+
+        for i in range(out_h):
+            for j in range(out_w):
+                window = padded[i : i + kh, j : j + kw]
+                output[i, j] = float(np.sum(window * kernel))
+
+        return output
+
+    def _rebuild_action_table(self):
+        """Recompute the discrete action lookup table.
+
+        The resulting space contains structured grid operations:
+        * paint individual cells to specific colours
+        * flood-fill connected regions with a target colour
+        * copy small patches between coarse locations
+        * mirror / rotate global patterns
+        * submit the current hypothesis
+        """
+
+        height = self.grid_height if self.grid_height > 0 else 10
+        width = self.grid_width if self.grid_width > 0 else 10
+
+        action_table: List[Dict[str, Any]] = []
+
+        for r in range(height):
+            for c in range(width):
+                for color in range(self.NUM_COLORS):
+                    action_table.append({
+                        'type': 'paint_cell',
+                        'row': r,
+                        'col': c,
+                        'color': color,
+                    })
+
+        for r in range(height):
+            for c in range(width):
+                for color in range(self.NUM_COLORS):
+                    action_table.append({
+                        'type': 'fill_region',
+                        'row': r,
+                        'col': c,
+                        'color': color,
+                    })
+
+        for src_r in range(0, height, self.COPY_PATCH_STRIDE):
+            for src_c in range(0, width, self.COPY_PATCH_STRIDE):
+                for dst_r in range(0, height, self.COPY_PATCH_STRIDE):
+                    for dst_c in range(0, width, self.COPY_PATCH_STRIDE):
+                        if src_r == dst_r and src_c == dst_c:
+                            continue
+                        action_table.append({
+                            'type': 'copy_patch',
+                            'src_row': src_r,
+                            'src_col': src_c,
+                            'dst_row': dst_r,
+                            'dst_col': dst_c,
+                        })
+
+        action_table.extend([
+            {'type': 'mirror', 'axis': 'horizontal'},
+            {'type': 'mirror', 'axis': 'vertical'},
+            {'type': 'rotate', 'k': 1},
+            {'type': 'rotate', 'k': 2},
+            {'type': 'rotate', 'k': 3},
+            {'type': 'submit'},
+        ])
+
+        self._action_table = action_table
+        self._action_dim = len(action_table)
+
+    def _apply_paint_cell(self, spec: Dict[str, Any]):
+        row = spec['row']
+        col = spec['col']
+        color = spec['color']
+
+        if row < self.grid_height and col < self.grid_width:
+            self.current_grid[row, col] = color
+
+    def _apply_fill_region(self, spec: Dict[str, Any]):
+        row = spec['row']
+        col = spec['col']
+        color = spec['color']
+
+        if row >= self.grid_height or col >= self.grid_width:
+            return
+
+        target_color = self.current_grid[row, col]
+        if target_color == color:
+            return
+
+        stack = [(row, col)]
+        visited = set()
+
+        while stack:
+            r, c = stack.pop()
+            if (
+                r < 0
+                or r >= self.grid_height
+                or c < 0
+                or c >= self.grid_width
+                or (r, c) in visited
+                or self.current_grid[r, c] != target_color
+            ):
+                continue
+
+            visited.add((r, c))
+            self.current_grid[r, c] = color
+            stack.extend([(r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)])
+
+    def _apply_copy_patch(self, spec: Dict[str, Any]):
+        src_r = spec['src_row']
+        src_c = spec['src_col']
+        dst_r = spec['dst_row']
+        dst_c = spec['dst_col']
+
+        patch = self._extract_patch(src_r, src_c)
+        if patch.size == 0:
+            return
+
+        h, w = patch.shape
+        end_r = min(dst_r + h, self.grid_height)
+        end_c = min(dst_c + w, self.grid_width)
+        patch_h = end_r - dst_r
+        patch_w = end_c - dst_c
+
+        if patch_h <= 0 or patch_w <= 0:
+            return
+
+        self.current_grid[dst_r:end_r, dst_c:end_c] = patch[:patch_h, :patch_w]
+
+    def _extract_patch(self, row: int, col: int) -> np.ndarray:
+        end_r = min(row + self.COPY_PATCH_SIZE, self.grid_height)
+        end_c = min(col + self.COPY_PATCH_SIZE, self.grid_width)
+        if end_r <= row or end_c <= col:
+            return np.array([], dtype=self.current_grid.dtype)
+        return self.current_grid[row:end_r, col:end_c].copy()
+
+    def _apply_mirror(self, spec: Dict[str, Any]):
+        axis = spec['axis']
+        if axis == 'horizontal':
+            self.current_grid = np.fliplr(self.current_grid)
+        elif axis == 'vertical':
+            self.current_grid = np.flipud(self.current_grid)
+
+    def _apply_rotate(self, spec: Dict[str, Any]):
+        k = spec['k'] % 4
+        if k:
+            original = self.current_grid
+            rotated = np.rot90(original, k=k)
+            target = np.zeros_like(original)
+            h = min(target.shape[0], rotated.shape[0])
+            w = min(target.shape[1], rotated.shape[1])
+            target[:h, :w] = rotated[:h, :w]
+            self.current_grid = target
+
     def get_state_components(self, state: Optional[np.ndarray] = None) -> Tuple:
         """
         Extract meaningful components from state for GVF cumulants.
@@ -242,6 +548,9 @@ class ARCEnvironment(OaKEnvironment):
             flat_grid = state[:self.MAX_GRID_SIZE * self.MAX_GRID_SIZE]
             grid = flat_grid.reshape(self.MAX_GRID_SIZE, self.MAX_GRID_SIZE)
             grid = grid[:self.grid_height, :self.grid_width]
+
+            # Values in state are normalized to [0, 1]; convert back to palette
+            grid = np.round(grid * (self.NUM_COLORS - 1)).astype(int)
 
         # Compute grid entropy
         unique, counts = np.unique(grid, return_counts=True)

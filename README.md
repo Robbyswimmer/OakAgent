@@ -198,6 +198,26 @@ Expected performance degradation when disabling components:
 - **No GVFs**: Unable to form meaningful options (breaks FC-STOMP)
 - **No IDBD**: ~10-20% slower (suboptimal step-sizes)
 
+### ARC Environment Prototype
+
+The ARC (Abstract Reasoning Challenge) environment in `environments/arc/` has
+been upgraded from a single-cell flip toy problem into a scaffold that better
+resembles the real benchmark:
+
+- **Rich action vocabulary** – options now operate on multi-cell structures
+  including flood-fills, 3×3 patch copies, global mirrors/rotations, and an
+  explicit submit action so episodes can terminate once a hypothesis is ready.
+- **Task-aware state encoding** – each state includes exemplar histograms,
+  coarse geometry, and handcrafted spatial features so policies and GVFs can
+  condition on the current puzzle rather than memorising average behaviour.
+- **Dense reward shaping** – reward reflects changes in match ratio, removing
+  the zero-signal dead-end and enabling curriculum-style training on easier
+  puzzles.
+
+This scaffold is still not a full ARC solver, but it provides the minimum hooks
+needed to experiment with object-centric options, curriculum design, and
+task-conditioned policies.
+
 ## OaK Compliance Verification
 
 The implementation satisfies all OaK principles:
