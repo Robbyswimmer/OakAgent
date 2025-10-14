@@ -29,13 +29,10 @@ class GridSimilarityGVF(GVF):
         In practice, match_ratio should be part of the state or computed from state.
         For now, we assume it's encoded in the state or available via info dict.
         """
-        # Extract match ratio from state components (last few dimensions)
-        # This is a simplified implementation - in practice, would need proper state encoding
-        if isinstance(state, np.ndarray) and len(state) > 3:
-            # Assume match ratio is encoded or we compute from grid
-            # Placeholder: return dummy value for now
-            return 0.5  # TODO: Extract actual similarity from state
-        return 0.5
+        if isinstance(state, np.ndarray) and state.size > 0:
+            match_ratio = float(state[-1])
+            return max(0.0, min(1.0, match_ratio))
+        return 0.0
 
 
 class EntropyGVF(GVF):
@@ -143,9 +140,10 @@ class ProgressGVF(GVF):
         Progress is measured by similarity to solution (if available)
         This is similar to GridSimilarityGVF but with different γ for longer-term prediction
         """
-        # In practice, this would be computed from state or environment info
-        # Placeholder implementation
-        return 0.5
+        if isinstance(state, np.ndarray) and state.size > 0:
+            match_ratio = float(state[-1])
+            return max(0.0, min(1.0, match_ratio))
+        return 0.0
 
 
 class ARCHordeGVFs:

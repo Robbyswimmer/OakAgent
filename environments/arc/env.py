@@ -22,14 +22,14 @@ class ARCEnvironment(OaKEnvironment):
     """
     ARC environment wrapper for OaK framework.
 
-    State: Flattened current grid + task features
-    Actions: Object-level transformations (fill, copy, rotate, etc.)
+    State: Flattened current grid + exemplar encodings + spatial features
+    Actions: Object-level transformations (fill, copy, rotate, exemplar copy, etc.)
     """
 
     # ARC color palette (0-9)
     NUM_COLORS = 10
     MAX_GRID_SIZE = 30  # ARC grids can be up to 30x30
-    MAX_TRAINING_EXAMPLES = 3  # ARC typically ships <=3 exemplars
+    DEFAULT_MAX_TRAINING_EXAMPLES = 7  # ARC tasks often include up to 7 exemplars
 
     # Parameters that control how many structured actions we expose.
     # Keeping them relatively small still gives us far richer behaviour
@@ -38,7 +38,13 @@ class ARCEnvironment(OaKEnvironment):
     COPY_PATCH_SIZE = 3
     COPY_PATCH_STRIDE = 3
 
-    def __init__(self, task_path: Optional[str] = None, max_steps: int = 50):
+    def __init__(
+        self,
+        task_path: Optional[str] = None,
+        max_steps: int = 50,
+        max_training_examples: Optional[int] = None,
+        reward_mode: str = "binary",
+    ):
         """
         Initialize ARC environment.
 
@@ -50,6 +56,10 @@ class ARCEnvironment(OaKEnvironment):
 
         self.max_steps = max_steps
         self.task_path = task_path
+
+        if reward_mode not in {"binary", "dense"}:
+            raise ValueError("reward_mode must be 'binary' or 'dense'")
+        self.reward_mode = reward_mode
 
         # Task data (will be loaded from file or dataset)
         self.training_examples = []  # List of (input_grid, output_grid) pairs
@@ -65,11 +75,12 @@ class ARCEnvironment(OaKEnvironment):
         self.grid_height = 0
         self.grid_width = 0
 
-        # Cached task embedding (built from exemplars)
-        self._task_feature_dim = (
-            self.MAX_TRAINING_EXAMPLES * (2 * self.NUM_COLORS + 3)
+        # Cached exemplar encodings (rebuilt when a new task is loaded)
+        self.max_training_examples = (
+            max_training_examples
+            if max_training_examples is not None
+            else self.DEFAULT_MAX_TRAINING_EXAMPLES
         )
-        self._cached_task_features = np.zeros(self._task_feature_dim, dtype=np.float32)
 
         # Derived feature sizes
         self._grid_flat_dim = self.MAX_GRID_SIZE * self.MAX_GRID_SIZE
@@ -79,13 +90,33 @@ class ARCEnvironment(OaKEnvironment):
         # Context terms: height, width, exemplar count, steps remaining, match ratio
         self._context_dim = 5
 
-        # State dimension: flattened grid + spatial backbone + task context + metadata
+        self._set_feature_buffers()
+
+    def _set_feature_buffers(self):
+        """Allocate buffers whose sizes depend on exemplar capacity."""
+
+        self._task_feature_dim = (
+            self.max_training_examples * (2 * self.NUM_COLORS + 3)
+        )
+        self._exemplar_flat_dim = self.max_training_examples * 2 * self._grid_flat_dim
+        self._cached_task_features = np.zeros(self._task_feature_dim, dtype=np.float32)
+        self._cached_exemplar_grids = np.zeros(self._exemplar_flat_dim, dtype=np.float32)
         self._state_dim = (
             self._grid_flat_dim
             + self._spatial_feature_dim
             + self._task_feature_dim
+            + self._exemplar_flat_dim
             + self._context_dim
         )
+
+    def _ensure_exemplar_capacity(self, count: int):
+        """Grow exemplar buffers if a task provides more examples than expected."""
+
+        if count <= self.max_training_examples:
+            return
+
+        self.max_training_examples = count
+        self._set_feature_buffers()
 
         # Action table populated once the task dimensions are known
         self._action_table = []
@@ -124,6 +155,8 @@ class ARCEnvironment(OaKEnvironment):
             for example in task_data['train']
         ]
 
+        self._ensure_exemplar_capacity(len(self.training_examples))
+
         # Load test case (use first test case)
         test_case = task_data['test'][0]
         self.test_input = np.array(test_case['input'])
@@ -134,6 +167,7 @@ class ARCEnvironment(OaKEnvironment):
 
         # Pre-compute exemplar embedding for richer task conditioning
         self._cached_task_features = self._compute_task_context_features()
+        self._cached_exemplar_grids = self._build_exemplar_stack()
 
         # Rebuild the structured action table now that we know task dimensions
         self._rebuild_action_table()
@@ -199,6 +233,10 @@ class ARCEnvironment(OaKEnvironment):
             self._apply_fill_region(spec)
         elif op_type == 'copy_patch':
             self._apply_copy_patch(spec)
+        elif op_type == 'copy_exemplar_patch':
+            self._apply_copy_exemplar_patch(spec)
+        elif op_type == 'stamp_exemplar_output':
+            self._apply_stamp_exemplar_output(spec)
         elif op_type == 'mirror':
             self._apply_mirror(spec)
         elif op_type == 'rotate':
@@ -208,20 +246,21 @@ class ARCEnvironment(OaKEnvironment):
         else:
             raise ValueError(f"Unknown action spec: {spec}")
 
-        # Match-based shaping before termination logic so submit respects accuracy
         new_match = self._compute_match_ratio()
         match_gain = new_match - prev_match
 
-        reward += match_gain * 5.0  # dense shaping encourages gradual progress
+        if self.reward_mode == 'dense':
+            reward += match_gain * 5.0
 
         if op_type == 'submit':
             if self._is_solution_correct():
                 reward += 1.0
-            else:
+            elif self.reward_mode == 'dense':
                 # Mild penalty for premature submission to encourage patience
                 reward -= 0.1
         elif self._is_solution_correct():
-            reward += 1.0
+            if self.reward_mode == 'dense':
+                reward += 1.0
             done = True
 
         if self.steps_taken >= self.max_steps and not done:
@@ -249,26 +288,30 @@ class ARCEnvironment(OaKEnvironment):
             state: Flattened state vector
         """
         # Flatten current grid to MAX_GRID_SIZE x MAX_GRID_SIZE (pad with zeros)
-        flat_grid = np.zeros((self.MAX_GRID_SIZE, self.MAX_GRID_SIZE), dtype=np.float32)
+        flat_grid = self._pad_and_normalize_grid(self.current_grid)
         normalized_grid = self.current_grid.astype(np.float32) / (self.NUM_COLORS - 1)
-        flat_grid[:self.grid_height, :self.grid_width] = normalized_grid
-        flat_grid = flat_grid.flatten()
 
         spatial_features = self._extract_spatial_features(normalized_grid)
         task_features = self._cached_task_features
+        exemplar_stack = self._cached_exemplar_grids
 
         # Metadata context (normalized for stability)
+        exemplar_ratio = (
+            min(len(self.training_examples), self.max_training_examples)
+            / max(1, self.max_training_examples)
+        )
         context = np.array([
             self.grid_height / self.MAX_GRID_SIZE,
             self.grid_width / self.MAX_GRID_SIZE,
-            min(len(self.training_examples), self.MAX_TRAINING_EXAMPLES)
-            / self.MAX_TRAINING_EXAMPLES,
+            exemplar_ratio,
             1.0 - (self.steps_taken / max(1, self.max_steps)),
             self.prev_match_ratio,
         ], dtype=np.float32)
 
         # Concatenate
-        state = np.concatenate([flat_grid, spatial_features, task_features, context])
+        state = np.concatenate(
+            [flat_grid, spatial_features, task_features, exemplar_stack, context]
+        )
         return state.astype(np.float32)
 
     def _is_solution_correct(self) -> bool:
@@ -305,7 +348,7 @@ class ARCEnvironment(OaKEnvironment):
         """
 
         features: List[float] = []
-        for idx in range(self.MAX_TRAINING_EXAMPLES):
+        for idx in range(self.max_training_examples):
             if idx < len(self.training_examples):
                 input_grid, output_grid = self.training_examples[idx]
                 features.extend(self._summarize_grid(input_grid))
@@ -317,6 +360,34 @@ class ARCEnvironment(OaKEnvironment):
                 features.extend([0.0] * (2 * self.NUM_COLORS + 3))
 
         return np.array(features, dtype=np.float32)
+
+    def _build_exemplar_stack(self) -> np.ndarray:
+        """Concatenate padded input/output grids for each exemplar."""
+
+        flattened: List[np.ndarray] = []
+        for idx in range(self.max_training_examples):
+            if idx < len(self.training_examples):
+                input_grid, output_grid = self.training_examples[idx]
+                flattened.append(self._pad_and_normalize_grid(input_grid))
+                flattened.append(self._pad_and_normalize_grid(output_grid))
+            else:
+                flattened.append(np.zeros(self._grid_flat_dim, dtype=np.float32))
+                flattened.append(np.zeros(self._grid_flat_dim, dtype=np.float32))
+
+        if not flattened:
+            return np.zeros(0, dtype=np.float32)
+
+        return np.concatenate(flattened).astype(np.float32)
+
+    def _pad_and_normalize_grid(self, grid: np.ndarray) -> np.ndarray:
+        """Return normalized grid padded to MAX_GRID_SIZE x MAX_GRID_SIZE and flattened."""
+
+        padded = np.zeros((self.MAX_GRID_SIZE, self.MAX_GRID_SIZE), dtype=np.float32)
+        if grid.size > 0:
+            normalized = grid.astype(np.float32) / (self.NUM_COLORS - 1)
+            h, w = grid.shape
+            padded[:h, :w] = normalized
+        return padded.flatten()
 
     def _summarize_grid(self, grid: np.ndarray) -> List[float]:
         """Return normalized color histogram for a grid."""
@@ -437,6 +508,41 @@ class ARCEnvironment(OaKEnvironment):
                             'dst_col': dst_c,
                         })
 
+        exemplar_cap = min(len(self.training_examples), self.max_training_examples)
+        if exemplar_cap:
+            exemplar_stride = max(1, self.COPY_PATCH_STRIDE * 2)
+            for ex_idx in range(exemplar_cap):
+                input_grid, output_grid = self.training_examples[ex_idx]
+                for source_name, source_grid in (
+                    ('input', input_grid),
+                    ('output', output_grid),
+                ):
+                    src_h, src_w = source_grid.shape
+                    for src_r in range(0, src_h, exemplar_stride):
+                        for src_c in range(0, src_w, exemplar_stride):
+                            for dst_r in range(0, height, exemplar_stride):
+                                for dst_c in range(0, width, exemplar_stride):
+                                    action_table.append({
+                                        'type': 'copy_exemplar_patch',
+                                        'example_idx': ex_idx,
+                                        'source': source_name,
+                                        'src_row': src_r,
+                                        'src_col': src_c,
+                                        'dst_row': dst_r,
+                                        'dst_col': dst_c,
+                                    })
+
+                # Whole exemplar output alignment (top-left anchor grid)
+                out_h, out_w = output_grid.shape
+                for dst_r in range(0, height, exemplar_stride):
+                    for dst_c in range(0, width, exemplar_stride):
+                        action_table.append({
+                            'type': 'stamp_exemplar_output',
+                            'example_idx': ex_idx,
+                            'dst_row': dst_r,
+                            'dst_col': dst_c,
+                        })
+
         action_table.extend([
             {'type': 'mirror', 'axis': 'horizontal'},
             {'type': 'mirror', 'axis': 'vertical'},
@@ -509,12 +615,74 @@ class ARCEnvironment(OaKEnvironment):
 
         self.current_grid[dst_r:end_r, dst_c:end_c] = patch[:patch_h, :patch_w]
 
+    def _apply_copy_exemplar_patch(self, spec: Dict[str, Any]):
+        example_idx = spec['example_idx']
+        source = spec['source']
+        src_r = spec['src_row']
+        src_c = spec['src_col']
+        dst_r = spec['dst_row']
+        dst_c = spec['dst_col']
+
+        patch = self._extract_exemplar_patch(example_idx, source, src_r, src_c)
+        if patch.size == 0:
+            return
+
+        h, w = patch.shape
+        end_r = min(dst_r + h, self.grid_height)
+        end_c = min(dst_c + w, self.grid_width)
+        patch_h = end_r - dst_r
+        patch_w = end_c - dst_c
+
+        if patch_h <= 0 or patch_w <= 0:
+            return
+
+        self.current_grid[dst_r:end_r, dst_c:end_c] = patch[:patch_h, :patch_w]
+
+    def _apply_stamp_exemplar_output(self, spec: Dict[str, Any]):
+        example_idx = spec['example_idx']
+        dst_r = spec['dst_row']
+        dst_c = spec['dst_col']
+
+        exemplar = self._get_exemplar_grid(example_idx, 'output')
+        if exemplar is None:
+            return
+
+        h, w = exemplar.shape
+        end_r = min(dst_r + h, self.grid_height)
+        end_c = min(dst_c + w, self.grid_width)
+        if end_r <= dst_r or end_c <= dst_c:
+            return
+
+        self.current_grid[dst_r:end_r, dst_c:end_c] = exemplar[: end_r - dst_r, : end_c - dst_c]
+
     def _extract_patch(self, row: int, col: int) -> np.ndarray:
         end_r = min(row + self.COPY_PATCH_SIZE, self.grid_height)
         end_c = min(col + self.COPY_PATCH_SIZE, self.grid_width)
         if end_r <= row or end_c <= col:
             return np.array([], dtype=self.current_grid.dtype)
         return self.current_grid[row:end_r, col:end_c].copy()
+
+    def _get_exemplar_grid(self, index: int, source: str) -> Optional[np.ndarray]:
+        if not (0 <= index < len(self.training_examples)):
+            return None
+
+        if source == 'input':
+            return self.training_examples[index][0]
+        if source == 'output':
+            return self.training_examples[index][1]
+        return None
+
+    def _extract_exemplar_patch(self, index: int, source: str, row: int, col: int) -> np.ndarray:
+        grid = self._get_exemplar_grid(index, source)
+        if grid is None:
+            return np.array([], dtype=np.int32)
+
+        end_r = min(row + self.COPY_PATCH_SIZE, grid.shape[0])
+        end_c = min(col + self.COPY_PATCH_SIZE, grid.shape[1])
+        if end_r <= row or end_c <= col:
+            return np.array([], dtype=grid.dtype)
+
+        return grid[row:end_r, col:end_c]
 
     def _apply_mirror(self, spec: Dict[str, Any]):
         axis = spec['axis']
