@@ -4,7 +4,7 @@
 #SBATCH --output=logs/oak_training_%j.txt
 #SBATCH --error=logs/oak_training_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --mem=64G
+#SBATCH --mem=48G
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mail-type=FAIL,END
@@ -13,6 +13,9 @@
 
 # Exit on error, undefined variables, and pipe failures
 set -euo pipefail
+
+# Force unbuffered output for Python
+export PYTHONUNBUFFERED=1
 
 # ============================================================================
 # OaK-CartPole SLURM Training Script
@@ -255,10 +258,15 @@ echo ""
 
 cd oak_cartpole
 
-# Run the main training script
-python main.py "${ARGS[@]}"
+# Run the main training script with unbuffered output
+echo "[SHELL] About to invoke Python script..."
+echo "[SHELL] Python version: $(python --version)"
+echo "[SHELL] Python path: $(which python)"
+echo "[SHELL] Starting training script NOW..."
+python -u main.py "${ARGS[@]}"
 
 TRAIN_EXIT_CODE=$?
+echo "[SHELL] Python process exited with code: ${TRAIN_EXIT_CODE}"
 
 cd ..
 
