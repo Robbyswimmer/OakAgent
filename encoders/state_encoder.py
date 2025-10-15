@@ -40,6 +40,15 @@ class StateEncoderBase(nn.Module):
         self.input_dim = config.input_dim
         self.latent_dim = config.latent_dim
 
+    @property
+    def device(self):
+        """Get the device of the encoder's parameters."""
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            # No parameters (e.g., IdentityEncoder), default to CPU
+            return torch.device('cpu')
+
     def encode_tensor(self, state: torch.Tensor) -> torch.Tensor:
         """Encode a batch of states (tensor) into latent embeddings."""
         raise NotImplementedError
@@ -197,7 +206,7 @@ class ArcVisualContextEncoder(StateEncoderBase):
     def encode_tensor(self, state: torch.Tensor) -> torch.Tensor:
         if state.dim() == 1:
             state = state.unsqueeze(0)
-        state = state.float()
+        state = state.float().to(self.device)
 
         latent, _ = self._encode_components(state)
         return latent
@@ -205,7 +214,7 @@ class ArcVisualContextEncoder(StateEncoderBase):
     def encode_with_tokens(self, state: torch.Tensor):
         if state.dim() == 1:
             state = state.unsqueeze(0)
-        state = state.float()
+        state = state.float().to(self.device)
         latent, token_dict = self._encode_components(state)
         return latent, token_dict
 
