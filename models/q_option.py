@@ -10,13 +10,27 @@ import torch.nn.functional as F
 
 from meta.idbd import TorchIDBD
 
-class OptionQNetwork(nn.Module):
-    """Q-network for options"""
 
-    def __init__(self, state_dim, num_options, hidden_size=128):
+def _resolve_device(device):
+    if device is None:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
+class OptionQNetwork(nn.Module):
+    """Q-network for options with optional state encoder"""
+
+    def __init__(self, state_dim, num_options, hidden_size=128, state_encoder=None, device=None):
         super().__init__()
         self.state_dim = state_dim
         self.num_options = num_options
+        self.device = _resolve_device(device)
+        if isinstance(state_encoder, nn.Module):
+            self._modules.pop('_state_encoder', None)
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
@@ -25,6 +39,8 @@ class OptionQNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, num_options)
         )
+
+        self.to(self.device)
 
     def forward(self, state):
         """
@@ -35,13 +51,24 @@ class OptionQNetwork(nn.Module):
             q_values: (batch, num_options) or (num_options,)
         """
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
         if state.dim() == 1:
             state = state.unsqueeze(0)
-            return self.net(state).squeeze(0)
 
-        return self.net(state)
+        encoder = getattr(self, "_state_encoder", None)
+        if encoder is not None:
+            with torch.no_grad():
+                state = encoder.encode_tensor(state)
+
+        output = self.net(state)
+        if output.dim() == 2 and output.size(0) == 1:
+            return output.squeeze(0)
+        return output
 
 
 class SMDPQNetwork:
@@ -57,11 +84,23 @@ class SMDPQNetwork:
         gamma=0.99,
         lr=1e-3,
         meta_config=None,
+        state_encoder=None,
+        latent_dim=None,
+        device=None,
     ):
         self.state_dim = state_dim
         self.num_options = num_options
         self.gamma = gamma
         self.base_lr = lr
+        self.device = _resolve_device(device)
+        if isinstance(state_encoder, nn.Module):
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
+
+        if latent_dim is None:
+            latent_dim = state_dim
+        self.latent_dim = latent_dim
 
         # Q-network (may be None until first option exists)
         self.q_net = None
@@ -81,7 +120,7 @@ class SMDPQNetwork:
 
     def _initialize_network(self, num_options):
         """Create Q-network and optimizer/meta-learner for current option count."""
-        self.q_net = OptionQNetwork(self.state_dim, num_options)
+        self.q_net = OptionQNetwork(self.latent_dim, num_options, state_encoder=self._state_encoder, device=self.device)
         if self.use_meta:
             self._reinit_meta()
             self.optimizer = None
@@ -130,25 +169,37 @@ class SMDPQNetwork:
 
         # Convert to tensors
         if isinstance(s_start, np.ndarray):
-            s_start = torch.FloatTensor(s_start)
+            s_start = torch.as_tensor(s_start, dtype=torch.float32, device=self.device)
+        elif isinstance(s_start, torch.Tensor):
+            s_start = s_start.to(self.device)
+        else:
+            s_start = torch.as_tensor(s_start, dtype=torch.float32, device=self.device)
         if isinstance(s_end, np.ndarray):
-            s_end = torch.FloatTensor(s_end)
+            s_end = torch.as_tensor(s_end, dtype=torch.float32, device=self.device)
+        elif isinstance(s_end, torch.Tensor):
+            s_end = s_end.to(self.device)
+        else:
+            s_end = torch.as_tensor(s_end, dtype=torch.float32, device=self.device)
 
         if s_start.dim() == 1:
             s_start = s_start.unsqueeze(0)
             s_end = s_end.unsqueeze(0)
 
-        option_id = torch.LongTensor([option_id])
-        R_total = torch.FloatTensor([R_total])
-        duration = torch.LongTensor([duration])
+        option_id = torch.tensor([option_id], dtype=torch.long, device=self.device)
+        R_total = torch.tensor([R_total], dtype=torch.float32, device=self.device)
+        duration = torch.tensor([duration], dtype=torch.float32, device=self.device)
 
         # Current Q-value: Q(s, o)
         q_values = self.q_net(s_start)
+        if q_values.dim() == 1:
+            q_values = q_values.unsqueeze(0)
         q_value = q_values.gather(1, option_id.unsqueeze(1)).squeeze(1)
 
         # Target Q-value with SMDP discounting
         with torch.no_grad():
             next_q_values = self.q_net(s_end)
+            if next_q_values.dim() == 1:
+                next_q_values = next_q_values.unsqueeze(0)
             next_q_value = next_q_values.max(dim=1)[0]
 
             # SMDP target: R + gamma^tau * max_o' Q(s', o')
@@ -162,7 +213,15 @@ class SMDPQNetwork:
             self.q_net.zero_grad(set_to_none=True)
             loss.backward()
             gradients = [param.grad for param in self.q_net.parameters()]
-            step_sizes = self.meta_updater.update_step_sizes(gradients, s_start)
+            if self._state_encoder is not None:
+                with torch.no_grad():
+                    feature_state = self._state_encoder.encode_tensor(s_start)
+                feature_state = feature_state.reshape(-1)
+                if feature_state.numel() == 0:
+                    feature_state = torch.ones(1, dtype=torch.float32, device=self.device)
+            else:
+                feature_state = torch.ones(1, dtype=torch.float32, device=self.device)
+            step_sizes = self.meta_updater.update_step_sizes(gradients, feature_state)
             self.meta_updater.apply_updates(self.q_net.parameters(), step_sizes)
             self.q_net.zero_grad(set_to_none=True)
         else:
@@ -178,6 +237,12 @@ class SMDPQNetwork:
         self.option_counts[option_id.item()] += 1
 
         return loss.item()
+
+    def to(self, device):
+        self.device = _resolve_device(device)
+        if self.q_net is not None:
+            self.q_net.to(self.device)
+        return self
 
     def update_from_trajectory(self, trajectory, option_id):
         """
@@ -232,7 +297,7 @@ class SMDPQNetwork:
             self._initialize_network(self.num_options)
         else:
             old_state = self.q_net.state_dict()
-            new_net = OptionQNetwork(self.state_dim, self.num_options)
+            new_net = OptionQNetwork(self.latent_dim, self.num_options, state_encoder=self._state_encoder, device=self.device)
             new_state = new_net.state_dict()
 
             # Copy shared layers

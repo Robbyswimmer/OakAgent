@@ -2,11 +2,15 @@
 Generalized Value Functions (GVFs) - Knowledge Layer
 Predictive knowledge as learned GVFs (OaK core principle #2)
 
-Each GVF predicts a specific cumulant under a policy:
-- g1: E[|theta|] - uprightness predictor
-- g2: E[|x|] - centering predictor
-- g3: E[|theta_dot| + |x_dot|] - stability predictor
-- g4: E[time-to-failure] - survival horizon predictor
+This module provides the generic GVF base class.
+Environment-specific GVF implementations should inherit from this class
+and implement the compute_cumulant() method.
+
+Example (CartPole):
+    See environments/cartpole/gvfs.py for UprignessGVF, CenteringGVF, etc.
+
+Example (ARC):
+    See environments/arc/gvfs.py for GridSimilarityGVF, EntropyGVF, etc.
 """
 import math
 import numpy as np
@@ -17,18 +21,38 @@ from collections import deque
 
 from meta.meta_optimizer import MetaOptimizerAdapter
 
+
+def _resolve_device(device, fallback=None):
+    """Utility to normalize device arguments."""
+    if device is None:
+        return torch.device(fallback if fallback is not None else ('cuda' if torch.cuda.is_available() else 'cpu'))
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
 class GVF(nn.Module):
     """
     Base Generalized Value Function
     Learns to predict E[cumulant] using TD learning
+
+    Subclasses must implement:
+        compute_cumulant(state) -> float: Returns the cumulant value for the given state
     """
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97, use_idbd=True):
+    def __init__(self, state_dim, hidden_size=64, gamma=0.97, use_idbd=True, state_encoder=None, device=None):
         super().__init__()
         self.state_dim = state_dim
         self.gamma = gamma
         self.use_idbd = use_idbd
         self.base_lr = 1e-3
+        self.device = _resolve_device(device)
+
+        if isinstance(state_encoder, nn.Module):
+            # Store encoder without registering it as a submodule so optimizer state stays external
+            self._modules.pop('_state_encoder', None)
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
 
         # Function approximator (small MLP)
         self.net = nn.Sequential(
@@ -45,9 +69,8 @@ class GVF(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Eligibility traces for TD(lambda)
-        self.traces = {name: torch.zeros_like(param)
-                      for name, param in self.net.named_parameters()}
+        self.to(self.device)
+        self._init_traces()
 
         # Prediction history for feature mining
         self.prediction_history = deque(maxlen=1000)
@@ -71,9 +94,17 @@ class GVF(nn.Module):
     def predict(self, state):
         """Predict value for given state"""
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if state.dim() == 1:
             state = state.unsqueeze(0)
+
+        if self._state_encoder is not None:
+            with torch.no_grad():
+                state = self._state_encoder.encode_tensor(state)
 
         with torch.no_grad():
             prediction = self.net(state).squeeze()
@@ -94,9 +125,17 @@ class GVF(nn.Module):
     def forward(self, state):
         """Forward pass (for training)"""
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if state.dim() == 1:
             state = state.unsqueeze(0)
+
+        if self._state_encoder is not None:
+            with torch.no_grad():
+                state = self._state_encoder.encode_tensor(state)
 
         prediction = self.net(state).squeeze(-1)
         return torch.clamp(prediction, -5.0, 5.0)
@@ -216,13 +255,30 @@ class GVF(nn.Module):
                 nn.init.xavier_uniform_(module.weight, gain=0.01)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        self._init_traces()
 
-    @staticmethod
-    def _feature_vector_from_state(state):
-        if isinstance(state, torch.Tensor):
-            vector = state.detach().cpu().numpy()
+    def _feature_vector_from_state(self, state):
+        if self._state_encoder is not None:
+            if isinstance(state, np.ndarray):
+                state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+            elif isinstance(state, torch.Tensor):
+                state_tensor = state.detach().to(self.device).float()
+            else:
+                state_tensor = torch.as_tensor(np.asarray(state, dtype=np.float32), device=self.device)
+
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+
+            with torch.no_grad():
+                encoded = self._state_encoder.encode_tensor(state_tensor)
+
+            vector = encoded.detach().cpu().numpy()
         else:
-            vector = np.asarray(state, dtype=np.float32)
+            if isinstance(state, torch.Tensor):
+                vector = state.detach().cpu().numpy()
+            else:
+                vector = np.asarray(state, dtype=np.float32)
+
         if vector.ndim > 1:
             vector = vector.reshape(-1)
         return vector
@@ -244,168 +300,28 @@ class GVF(nn.Module):
             return 0.0
         return float(np.mean(list(self.normalized_error_history)))
 
-
-class UprignessGVF(GVF):
-    """g1: Predicts E[|theta|] - how upright the pole is"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "uprightness"
-        self.theta_max = 0.2095  # ~12 degrees (CartPole termination threshold)
-
     def compute_cumulant(self, state):
-        """Cumulant: normalized |theta| ∈ [0, 1]"""
-        if isinstance(state, np.ndarray):
-            theta = state[2]  # theta is 3rd component
-        else:
-            theta = state[..., 2]
-        return abs(theta) / self.theta_max
+        """
+        Compute the cumulant for this GVF.
+        Must be implemented by subclasses.
 
+        Args:
+            state: Environment state (numpy array or torch tensor)
 
-class CenteringGVF(GVF):
-    """g2: Predicts E[|x|] - how centered the cart is"""
+        Returns:
+            cumulant: Scalar value representing the cumulant
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "centering"
-        self.x_max = 2.4  # CartPole termination threshold
+        Example (CartPole uprightness):
+            return abs(state[2]) / 0.2095  # |theta| normalized
 
-    def compute_cumulant(self, state):
-        """Cumulant: normalized |x| ∈ [0, 1]"""
-        if isinstance(state, np.ndarray):
-            x = state[0]  # x is 1st component
-        else:
-            x = state[..., 0]
-        return abs(x) / self.x_max
+        Example (ARC grid similarity):
+            return np.mean(current_grid == solution_grid)
+        """
+        raise NotImplementedError("Subclasses must implement compute_cumulant()")
 
-
-class StabilityGVF(GVF):
-    """g3: Predicts E[|theta_dot| + |x_dot|] - velocity stability"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "stability"
-        self.velocity_scale = 5.0  # Empirical max for |theta_dot| + |x_dot|
-
-    def compute_cumulant(self, state):
-        """Cumulant: normalized velocity magnitude ∈ [0, 1]"""
-        if isinstance(state, np.ndarray):
-            x_dot = state[1]
-            theta_dot = state[3]
-        else:
-            x_dot = state[..., 1]
-            theta_dot = state[..., 3]
-        total_velocity = abs(theta_dot) + abs(x_dot)
-        return min(total_velocity / self.velocity_scale, 1.0)
-
-
-class SurvivalGVF(GVF):
-    """g4: Predicts E[time-to-failure] - survival horizon"""
-
-    def __init__(self, state_dim, hidden_size=64, gamma=0.99, horizon=200.0):
-        super().__init__(state_dim, hidden_size, gamma)
-        self.name = "survival"
-        self.horizon = horizon
-
-    def compute_cumulant(self, state):
-        """Cumulant: 1.0 per step survived (will be normalized by 1/(1-γ) in predict)."""
-        return 1.0
-
-
-class HordeGVFs:
-    """
-    Horde of GVFs - collection of all predictive knowledge
-    Updates all GVFs in parallel (OaK continual learning)
-    """
-
-    def __init__(self, state_dim, config, meta_config=None):
-        self.state_dim = state_dim
-
-        # Create the 4 core GVFs
-        self.gvfs = {
-            'uprightness': UprignessGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'centering': CenteringGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'stability': StabilityGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'survival': SurvivalGVF(
-                state_dim,
-                config.GVF_HIDDEN_SIZE,
-                config.GVF_GAMMA_LONG,
-                horizon=getattr(config, 'FC_SURVIVAL_TARGET', 200.0),
-            ),
+    def _init_traces(self):
+        """Initialize eligibility traces on the correct device."""
+        self.traces = {
+            name: torch.zeros_like(param, device=self.device)
+            for name, param in self.net.named_parameters()
         }
-
-        self.config = config
-
-        base_lr = getattr(config, 'GVF_LR', 1e-3)
-        meta_cfg = None
-        if meta_config is not None:
-            meta_cfg = meta_config.copy()
-            meta_cfg['init_log_alpha'] = math.log(base_lr)
-        for gvf in self.gvfs.values():
-            gvf.configure_optimizer(base_lr=base_lr, meta_config=meta_cfg)
-
-    def predict_all(self, state):
-        """Get predictions from all GVFs"""
-        predictions = {}
-        for name, gvf in self.gvfs.items():
-            predictions[name] = gvf.predict(state)
-        return predictions
-
-    def update_all(self, state, next_state, done, step_sizes=None):
-        """
-        Update all GVFs with their respective cumulants
-        (continual learning - called every step)
-
-        Returns: dict of td_errors for meta-learning
-        """
-        td_errors = {}
-
-        for name, gvf in self.gvfs.items():
-            # Compute cumulant for this GVF
-            cumulant = gvf.compute_cumulant(state)
-
-            # Get step-size from IDBD if provided
-            step_size = step_sizes.get(name) if step_sizes else None
-
-            # Update GVF
-            gamma = 0.0 if done else gvf.gamma
-            td_error = gvf.update(state, cumulant, next_state, gamma=gamma, step_size=step_size)
-            td_errors[name] = td_error
-
-        return td_errors
-
-    def get_feature_vector(self, state):
-        """
-        Get feature vector from GVF predictions
-        This is the "knowledge" that drives option formation
-        """
-        predictions = self.predict_all(state)
-        return np.array([predictions['uprightness'],
-                        predictions['centering'],
-                        predictions['stability'],
-                        predictions['survival']])
-
-    def get_prediction_histories(self):
-        """Get recent predictions from all GVFs for feature mining"""
-        histories = {}
-        for name, gvf in self.gvfs.items():
-            histories[name] = gvf.get_recent_predictions()
-        return histories
-
-    def get_average_errors(self):
-        """Get average prediction errors for all GVFs"""
-        errors = {}
-        for name, gvf in self.gvfs.items():
-            errors[name] = gvf.get_average_error()
-        return errors
-
-    def get_normalized_errors(self):
-        """Get normalized TD errors for all GVFs."""
-        normalized = {}
-        for name, gvf in self.gvfs.items():
-            normalized[name] = gvf.get_normalized_error()
-        return normalized
-
-    def __getitem__(self, name):
-        """Access GVF by name"""
-        return self.gvfs[name]

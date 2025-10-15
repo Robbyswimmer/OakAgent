@@ -535,9 +535,14 @@ class OptionPruner:
         # Track option performance
         self.option_performance = {}
 
-    def evaluate_options(self, current_step, recent_usage=None):
+    def evaluate_options(self, current_step, recent_usage=None, steps_since_shift=None):
         """
         Evaluate all options and identify candidates for pruning
+
+        Args:
+            current_step: Current training step
+            recent_usage: Recent option usage statistics
+            steps_since_shift: Steps since last regime shift (Fix #7: adaptive thresholds)
 
         Returns:
             list of option_ids to prune
@@ -548,8 +553,17 @@ class OptionPruner:
         recent_usage = recent_usage or {}
         recent_min_starts = getattr(self.config, 'FC_OPTION_PRUNE_RECENT_STARTS', 5)
 
+        # Adaptive thresholds based on time since shift (Fix #7)
+        if steps_since_shift is not None and steps_since_shift < getattr(self.config, 'AGGRESSIVE_PRUNING_WINDOW', 1000):
+            # Recently shifted - use aggressive pruning
+            success_threshold = 0.10  # More lenient (vs default 0.05)
+            min_age = 500  # Faster pruning (vs default 2500)
+        else:
+            # Stable regime - use normal thresholds
+            success_threshold = self.config.FC_OPTION_SUCCESS_THRESHOLD
+            min_age = getattr(self.config, 'FC_OPTION_PRUNE_MIN_AGE_STEPS', 2500)
+
         min_executions = getattr(self.config, 'FC_OPTION_MIN_EXECUTIONS', 10)
-        min_age = getattr(self.config, 'FC_OPTION_PRUNE_MIN_AGE_STEPS', 0)
 
         for option_id, option_stats in stats.items():
             option = self.option_library.get_option(option_id)
@@ -564,8 +578,19 @@ class OptionPruner:
                 continue
 
             # Pruning criteria:
-            # 1. Low success rate
-            if option_stats['success_rate'] < self.config.FC_OPTION_SUCCESS_THRESHOLD:
+            # 1. Low success rate (use windowed rate for continual learning - Fix #2)
+            # Get windowed success rate if available, otherwise fall back to cumulative
+            if option is not None and hasattr(option, 'get_recent_success_rate'):
+                recent_success = option.get_recent_success_rate()
+                # Need at least 10 recent executions for reliable windowed estimate
+                if recent_success is not None and len(option.recent_executions) >= 10:
+                    success_rate = recent_success
+                else:
+                    success_rate = option_stats['success_rate']  # Fall back to cumulative
+            else:
+                success_rate = option_stats['success_rate']
+
+            if success_rate < success_threshold:
                 to_prune.append(option_id)
                 continue
 
@@ -575,7 +600,7 @@ class OptionPruner:
                 if usage_stats:
                     if (
                         usage_stats['starts'] >= recent_min_starts
-                        and usage_stats['success_rate'] < self.config.FC_OPTION_SUCCESS_THRESHOLD
+                        and usage_stats['success_rate'] < success_threshold
                     ):
                         to_prune.append(option_id)
                         continue
@@ -611,6 +636,10 @@ class FCSTOMPManager:
         self.subtask_former = SubtaskFormation(config)
         self.pruner = OptionPruner(option_library, config)
 
+        # Track steps since regime shift (Fix #7: adaptive pruning)
+        self.steps_since_shift = 0
+        self.shift_step = 0
+
         # Track FC-STOMP events
         self.fc_stomp_history = []
         self.last_run_step = 0
@@ -636,6 +665,9 @@ class FCSTOMPManager:
         Returns:
             dict with cycle results
         """
+        # Update steps since shift (Fix #7: adaptive pruning)
+        self.steps_since_shift = current_step - self.shift_step
+
         results = {
             'step': current_step,
             'features_mined': 0,
@@ -654,7 +686,9 @@ class FCSTOMPManager:
 
         # P: Prune underperforming options FIRST (OaK continual adaptation)
         # This clears space for immediate recreation from controllable features
-        options_to_prune = self.pruner.evaluate_options(current_step, recent_option_usage)
+        options_to_prune = self.pruner.evaluate_options(
+            current_step, recent_option_usage, steps_since_shift=self.steps_since_shift
+        )
         for option_id in options_to_prune:
             # Only process options that are not protected by configuration.
             if not self.option_library.is_protected(option_id):
@@ -837,3 +871,51 @@ class FCSTOMPManager:
     def get_history(self):
         """Get FC-STOMP execution history"""
         return self.fc_stomp_history
+
+    def trigger_regime_adaptation(self, current_step=None):
+        """
+        Trigger aggressive adaptation on regime shift (Fix #6)
+
+        Args:
+            current_step: Current training step (for tracking time since shift)
+
+        - Clear all non-protected options
+        - Reset feature spawn cooldowns
+        - Return count of pruned options
+
+        Returns:
+            Number of options pruned
+        """
+        pruned_count = 0
+
+        # Track shift timing (Fix #7)
+        if current_step is not None:
+            self.shift_step = current_step
+
+        # Clear all non-protected options
+        for option_id in list(self.option_library.get_option_ids()):
+            if not self.option_library.is_protected(option_id):
+                # Remove from option models
+                if hasattr(self.option_models, 'remove_option'):
+                    self.option_models.remove_option(option_id)
+
+                # Reset option Q-values
+                if hasattr(self.q_option, 'reset_option'):
+                    self.q_option.reset_option(option_id)
+
+                # Remove from library
+                self.pruner.prune_option(option_id)
+                pruned_count += 1
+
+        # Clear spawn cooldowns to allow immediate option recreation
+        self.feature_last_spawn_step.clear()
+
+        # Clear subtask mappings
+        self.subtask_to_option.clear()
+
+        # Reset shift tracking (Fix #7)
+        self.steps_since_shift = 0
+
+        print(f"[REGIME ADAPTATION] Cleared {pruned_count} options for fresh start")
+
+        return pruned_count

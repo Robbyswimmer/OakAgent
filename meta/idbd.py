@@ -92,6 +92,23 @@ class IDBD:
 
         self._ensure_float64()
 
+        features = features.reshape(-1)
+        if features.size != gradient.size:
+            if features.size == 1:
+                features = np.full_like(gradient, float(features.item()))
+            else:
+                repeat_count = int(np.floor(gradient.size / max(1, features.size)))
+                tiled = np.tile(features, max(1, repeat_count))
+                remainder = gradient.size - tiled.size
+                if remainder > 0:
+                    tiled = np.concatenate([
+                        tiled,
+                        np.full(remainder, features[:remainder].mean() if remainder <= features.size else features.mean())
+                    ])
+                features = tiled
+            if features.size != gradient.size:
+                features = np.ones_like(gradient)
+
         # Update eligibility trace: h = h + features * gradient
         self.h = self.h + features * gradient
 
@@ -226,13 +243,19 @@ class TorchIDBD(nn.Module):
     def update_step_sizes(self, gradients, features, td_error=None):
         """Update per-parameter step-sizes using current gradients."""
 
-        usable_grads = [g for g in gradients if g is not None]
-        if not usable_grads:
-            return [torch.zeros(shape) for shape in self.param_shapes]
+        if all(g is None for g in gradients):
+            return [torch.zeros(shape, dtype=torch.float32) for shape in self.param_shapes]
 
-        flat_grad = np.concatenate(
-            [g.detach().cpu().numpy().reshape(-1) for g in usable_grads]
-        ).astype(np.float64)
+        flat_grads = []
+        for grad, size in zip(gradients, self.param_sizes):
+            if grad is None:
+                flat_grads.append(np.zeros(size, dtype=np.float64))
+            else:
+                flat_grads.append(
+                    grad.detach().cpu().numpy().reshape(-1).astype(np.float64)
+                )
+
+        flat_grad = np.concatenate(flat_grads)
 
         if isinstance(features, torch.Tensor):
             features = features.detach().cpu().numpy()
@@ -248,9 +271,10 @@ class TorchIDBD(nn.Module):
         if features.size == 0:
             features = np.ones_like(flat_grad)
 
-        feature_vector = np.tile(features, len(flat_grad) // len(features) + 1)[
+        feature_vector = np.tile(features, len(flat_grad) // max(1, len(features)) + 1)[
             : len(flat_grad)
         ].astype(np.float64)
+        feature_vector = feature_vector.reshape(-1)
 
         step_sizes = self.idbd.update(flat_grad, feature_vector, td_error)
 
