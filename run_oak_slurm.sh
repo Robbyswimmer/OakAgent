@@ -256,8 +256,6 @@ fi
 
 echo ""
 
-cd oak_cartpole
-
 # Run the main training script with unbuffered output
 echo "[SHELL] About to invoke Python script..."
 echo "[SHELL] Python version: $(python --version)"
@@ -267,8 +265,6 @@ python -u main.py "${ARGS[@]}"
 
 TRAIN_EXIT_CODE=$?
 echo "[SHELL] Python process exited with code: ${TRAIN_EXIT_CODE}"
-
-cd ..
 
 echo ""
 echo "=========================================="
@@ -284,11 +280,9 @@ echo ""
 # Post-Training Analysis (Optional)
 # ============================================================================
 
-if [[ ${TRAIN_EXIT_CODE} -eq 0 ]] && [[ -f "oak_cartpole/visualize.py" ]]; then
+if [[ ${TRAIN_EXIT_CODE} -eq 0 ]] && [[ -f "visualize.py" ]]; then
   echo "Generating visualizations..."
-  cd oak_cartpole
   python visualize.py --output-dir "${OUTPUT_ROOT}" || true
-  cd ..
   echo "✓ Visualizations saved to ${OUTPUT_ROOT}"
 fi
 
