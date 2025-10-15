@@ -137,6 +137,9 @@ class DynamicsEnsemble:
         self.ensemble_size = ensemble_size
         self._state_encoder = state_encoder
         self.device = _resolve_device(device)
+        self.hidden_size = hidden_size
+        self.lr = lr
+        self.meta_config = meta_config.copy() if meta_config is not None else None
 
         if latent_dim is None:
             latent_dim = state_dim
@@ -155,18 +158,74 @@ class DynamicsEnsemble:
             for _ in range(ensemble_size)
         ]
 
-        meta_cfg = meta_config.copy() if meta_config is not None else None
-
         # Optimizers for each model
         self.optimizers = [
-            MetaOptimizerAdapter(model.parameters(), base_lr=lr, meta_config=meta_cfg)
-        for model in self.models
+            MetaOptimizerAdapter(
+                model.parameters(),
+                base_lr=self.lr,
+                meta_config=self.meta_config.copy() if self.meta_config is not None else None,
+            )
+            for model in self.models
         ]
 
         # Track prediction errors
         self.prediction_errors = []
 
         self.to(self.device)
+
+    def resize_action_dim(self, new_action_dim):
+        new_action_dim = int(new_action_dim)
+        if new_action_dim == self.action_dim:
+            return
+
+        old_models = self.models
+        self.action_dim = new_action_dim
+
+        new_models = []
+        new_optimizers = []
+
+        for old_model in old_models:
+            new_model = DynamicsNet(
+                self.state_dim,
+                new_action_dim,
+                latent_dim=self.latent_dim,
+                hidden_size=self.hidden_size,
+                state_encoder=self._state_encoder,
+                device=self.device,
+            )
+
+            with torch.no_grad():
+                old_first = old_model.shared[0]
+                new_first = new_model.shared[0]
+                new_first.bias.copy_(old_first.bias)
+
+                latent_dim = old_model.latent_dim
+                new_first.weight[:, :latent_dim] = old_first.weight[:, :latent_dim]
+
+                overlap = min(old_model.action_dim, new_action_dim)
+                if overlap > 0:
+                    new_first.weight[:, latent_dim:latent_dim + overlap] = (
+                        old_first.weight[:, latent_dim:latent_dim + overlap]
+                    )
+
+                old_second = old_model.shared[2]
+                new_second = new_model.shared[2]
+                new_second.weight.copy_(old_second.weight)
+                new_second.bias.copy_(old_second.bias)
+
+                new_model.delta_head.weight.copy_(old_model.delta_head.weight)
+                new_model.delta_head.bias.copy_(old_model.delta_head.bias)
+                new_model.reward_head.weight.copy_(old_model.reward_head.weight)
+                new_model.reward_head.bias.copy_(old_model.reward_head.bias)
+
+            meta_cfg = self.meta_config.copy() if self.meta_config is not None else None
+            new_models.append(new_model)
+            new_optimizers.append(
+                MetaOptimizerAdapter(new_model.parameters(), base_lr=self.lr, meta_config=meta_cfg)
+            )
+
+        self.models = new_models
+        self.optimizers = new_optimizers
 
     def predict(self, state, action, return_std=False):
         """

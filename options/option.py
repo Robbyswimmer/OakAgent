@@ -115,6 +115,35 @@ class Option:
         """Select action using option's internal policy"""
         return self.policy.select_action(state)
 
+    def update_action_dim(self, action_dim):
+        action_dim = int(action_dim)
+        if action_dim == self.action_dim:
+            return
+
+        hidden_size = self.policy.net[0].out_features
+        device = next(self.policy.parameters()).device
+        new_policy = OptionPolicy(self.state_dim, action_dim, hidden_size).to(device)
+
+        with torch.no_grad():
+            old_first = self.policy.net[0]
+            new_first = new_policy.net[0]
+            new_first.weight.copy_(old_first.weight)
+            if old_first.bias is not None and new_first.bias is not None:
+                new_first.bias.copy_(old_first.bias)
+
+            old_last = self.policy.net[2]
+            new_last = new_policy.net[2]
+            overlap = min(self.action_dim, action_dim)
+            if overlap > 0:
+                new_last.weight[:overlap] = old_last.weight[:overlap]
+                if old_last.bias is not None and new_last.bias is not None:
+                    new_last.bias[:overlap] = old_last.bias[:overlap]
+
+        self.policy = new_policy
+        self.action_dim = action_dim
+        self.policy_optimizer = None
+        self.value_optimizer = None
+
     def configure_optimizers(
         self,
         policy_lr=None,

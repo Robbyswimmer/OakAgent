@@ -134,6 +134,48 @@ class DoubleQNetwork:
         with torch.no_grad():
             return self.q_net(state).cpu().numpy()
 
+    def resize_action_dim(self, new_action_dim):
+        """Adjust networks when the action space size changes."""
+        if int(new_action_dim) == self.action_dim:
+            return
+
+        new_action_dim = int(new_action_dim)
+        self.action_dim = new_action_dim
+
+        def _resize_network(net: QNetwork, action_dim: int):
+            last_layer = net.net[-1]
+            if last_layer.out_features == action_dim:
+                return
+            new_layer = nn.Linear(last_layer.in_features, action_dim, device=self.device)
+            with torch.no_grad():
+                overlap = min(last_layer.out_features, action_dim)
+                if overlap > 0:
+                    new_layer.weight[:overlap] = last_layer.weight[:overlap]
+                    if last_layer.bias is not None and new_layer.bias is not None:
+                        new_layer.bias[:overlap] = last_layer.bias[:overlap]
+            net.net[-1] = new_layer
+            net.action_dim = action_dim
+
+        _resize_network(self.q_net, new_action_dim)
+        _resize_network(self.target_net, new_action_dim)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+
+        if self.use_meta:
+            self.meta_updater = TorchIDBD(
+                self.q_net.parameters(),
+                mu=self.meta_config.get("mu", 1e-3),
+                init_log_alpha=self.meta_config.get(
+                    "init_log_alpha", np.log(max(self.base_lr, 1e-6))
+                ),
+                meta_type=self.meta_config.get("type", "idbd"),
+                min_alpha=self.meta_config.get("min_alpha", 1e-6),
+                max_alpha=self.meta_config.get("max_alpha", 1.0),
+            )
+            self.optimizer = None
+        else:
+            self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.base_lr)
+            self.meta_updater = None
+
     def select_action(self, state, epsilon=0.0):
         """Epsilon-greedy action selection"""
         if np.random.rand() < epsilon:

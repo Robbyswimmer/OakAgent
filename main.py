@@ -60,6 +60,8 @@ class OaKAgent:
         self._log(f"Device: {self.device}")
         self._log(f"Log file: {self.log_file}")
 
+        self._action_modules_ready = False
+
         # Create environment using factory
         env_kwargs = {}
         if env_name.lower() == 'arc':
@@ -101,12 +103,22 @@ class OaKAgent:
             self.env = create_environment(env_name, **env_kwargs)
             self.continual_metrics = None
 
+        self.is_arc = env_name.lower() == 'arc'
+        self.arc_train_tasks = None
+        self.arc_test_tasks = None
+        if self.is_arc:
+            self._initialize_arc_tasks()
+            initial_task_path = self._sample_arc_task_path(for_eval=False)
+            if hasattr(self.env, 'load_task'):
+                self.env.load_task(initial_task_path)
+            if hasattr(self.env, 'set_mode'):
+                self.env.set_mode('train')
+
         # Shared representation encoder (CNN/attention for ARC, identity otherwise)
         self.state_encoder = create_state_encoder(env_name, self.env, config)
         if isinstance(self.state_encoder, torch.nn.Module):
             self.state_encoder = self.state_encoder.to(self.device)
         self.latent_dim = getattr(self.state_encoder, 'latent_dim', self.env.state_dim)
-        self.is_arc = env_name.lower() == 'arc'
 
         self.meta_config = None
         if not config.ABLATION_NO_IDBD:
@@ -291,6 +303,10 @@ class OaKAgent:
         for option_id in self.option_library.get_option_ids():
             self.option_models.add_option(option_id)
 
+        self._action_modules_ready = True
+        if self.is_arc:
+            self._sync_action_spaces()
+
         # Training state
         self.total_steps = 0
         self.epsilon = config.EPSILON_START
@@ -304,13 +320,8 @@ class OaKAgent:
         self.episode_lengths = []
         self.episode_option_stats = []
 
-        # ARC-specific task management
-        self.arc_train_tasks = None
-        self.arc_test_tasks = None
-        if self.env_name.lower() == 'arc':
-            self._initialize_arc_tasks()
-            if hasattr(self.env, 'set_mode'):
-                self.env.set_mode('train')
+        if self.is_arc and hasattr(self.env, 'set_mode'):
+            self.env.set_mode('train')
 
     def _log(self, message):
         """Log message to both stdout and log file with flush"""
@@ -1188,6 +1199,32 @@ class OaKAgent:
         task_path = self._sample_arc_task_path(for_eval=for_eval)
         if hasattr(self.env, 'load_task'):
             self.env.load_task(task_path)
+            self._sync_action_spaces()
+
+    def _sync_action_spaces(self):
+        """Ensure action-dependent modules match the environment's action space."""
+        if not getattr(self, '_action_modules_ready', False):
+            return
+
+        new_action_dim = getattr(self.env, 'action_dim', None)
+        if new_action_dim is None:
+            return
+
+        if hasattr(self.q_primitive, 'resize_action_dim'):
+            self.q_primitive.resize_action_dim(new_action_dim)
+        elif hasattr(self.q_primitive, 'action_dim'):
+            self.q_primitive.action_dim = new_action_dim
+
+        if hasattr(self.dyn_model, 'resize_action_dim'):
+            self.dyn_model.resize_action_dim(new_action_dim)
+        elif hasattr(self.dyn_model, 'action_dim'):
+            self.dyn_model.action_dim = new_action_dim
+
+        if self.option_library is not None and hasattr(self.option_library, 'resize_action_dim'):
+            self.option_library.resize_action_dim(new_action_dim)
+
+        if hasattr(self.planner, 'q_primitive'):
+            self.planner.q_primitive = self.q_primitive
 
 
 def main(env_name='cartpole', config_type='default'):

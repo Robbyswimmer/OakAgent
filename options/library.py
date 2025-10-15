@@ -47,6 +47,17 @@ class OptionLibrary:
         """Get number of options"""
         return len(self.options)
 
+    def resize_action_dim(self, new_action_dim):
+        new_action_dim = int(new_action_dim)
+        if new_action_dim == self.action_dim:
+            return
+        self.action_dim = new_action_dim
+        for option in self.options:
+            if option is None:
+                continue
+            option.update_action_dim(new_action_dim)
+            self._configure_option_optimizers(option)
+
     def add_option(self, option):
         """Dynamically add a new option (for FC-STOMP)"""
         option_id = option.option_id if option.option_id is not None and option.option_id >= 0 else None

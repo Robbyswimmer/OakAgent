@@ -165,3 +165,10 @@ class ArcHierarchicalQWrapper:
         self.base_q = self.base_q.to(device)
         self.action_head = self.action_head.to(device)
         return self
+
+    def resize_action_dim(self, new_action_dim: int):
+        if hasattr(self.base_q, 'resize_action_dim'):
+            self.base_q.resize_action_dim(new_action_dim)
+        elif hasattr(self.base_q, 'action_dim'):
+            self.base_q.action_dim = int(new_action_dim)
+        self.action_dim = int(new_action_dim)
