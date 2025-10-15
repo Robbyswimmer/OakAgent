@@ -1226,6 +1226,21 @@ class OaKAgent:
         if hasattr(self.planner, 'q_primitive'):
             self.planner.q_primitive = self.q_primitive
 
+        removed_real = self.rb_real.prune_invalid_actions(new_action_dim)
+        removed_sim = self.rb_sim.prune_invalid_actions(new_action_dim)
+        if removed_real or removed_sim:
+            self._log(
+                f"Pruned {removed_real} real and {removed_sim} simulated transitions after action-space resize"
+            )
+
+        if hasattr(self, 'action_history') and self.action_history is not None:
+            filtered_actions = [
+                act for act in self.action_history
+                if isinstance(act, (int, np.integer)) and 0 <= int(act) < new_action_dim
+            ]
+            if len(filtered_actions) != len(self.action_history):
+                self.action_history = deque(filtered_actions, maxlen=self.action_history.maxlen)
+
 
 def main(env_name='cartpole', config_type='default'):
     """Main entry point"""

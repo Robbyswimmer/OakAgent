@@ -181,6 +181,52 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
 
+    def prune_invalid_actions(self, max_action):
+        """Remove transitions whose action index lies outside [0, max_action)."""
+        max_action = int(max_action)
+        if self.size == 0:
+            return 0
+
+        actions = self.actions[: self.size]
+        valid_mask = (actions >= 0) & (actions < max_action)
+        if valid_mask.ndim > 1:
+            valid_mask = valid_mask.all(axis=1)
+        else:
+            valid_mask = valid_mask.reshape(-1)
+
+        valid_count = int(valid_mask.sum())
+        removed = int(self.size - valid_count)
+        if removed > 0:
+            self.states[:valid_count] = self.states[: self.size][valid_mask]
+            self.actions[:valid_count] = self.actions[: self.size][valid_mask]
+            self.rewards[:valid_count] = self.rewards[: self.size][valid_mask]
+            self.next_states[:valid_count] = self.next_states[: self.size][valid_mask]
+            self.dones[:valid_count] = self.dones[: self.size][valid_mask]
+            self.size = valid_count
+            self.ptr = valid_count % self.capacity
+
+        if self.reservoir_count > 0:
+            res_actions = self.reservoir_actions[: self.reservoir_count]
+            res_mask = (res_actions >= 0) & (res_actions < max_action)
+            if res_mask.ndim > 1:
+                res_mask = res_mask.all(axis=1)
+            else:
+                res_mask = res_mask.reshape(-1)
+
+            res_valid = int(res_mask.sum())
+            res_removed = int(self.reservoir_count - res_valid)
+            if res_removed > 0:
+                self.reservoir_states[:res_valid] = self.reservoir_states[: self.reservoir_count][res_mask]
+                self.reservoir_actions[:res_valid] = self.reservoir_actions[: self.reservoir_count][res_mask]
+                self.reservoir_rewards[:res_valid] = self.reservoir_rewards[: self.reservoir_count][res_mask]
+                self.reservoir_next_states[:res_valid] = self.reservoir_next_states[: self.reservoir_count][res_mask]
+                self.reservoir_dones[:res_valid] = self.reservoir_dones[: self.reservoir_count][res_mask]
+                self.reservoir_count = res_valid
+                self.reservoir_ptr = res_valid % max(1, self.reservoir_size)
+            removed += res_removed
+
+        return removed
+
 
 class TrajectoryBuffer:
     """
