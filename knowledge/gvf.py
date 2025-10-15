@@ -21,6 +21,15 @@ from collections import deque
 
 from meta.meta_optimizer import MetaOptimizerAdapter
 
+
+def _resolve_device(device, fallback=None):
+    """Utility to normalize device arguments."""
+    if device is None:
+        return torch.device(fallback if fallback is not None else ('cuda' if torch.cuda.is_available() else 'cpu'))
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
 class GVF(nn.Module):
     """
     Base Generalized Value Function
@@ -30,12 +39,20 @@ class GVF(nn.Module):
         compute_cumulant(state) -> float: Returns the cumulant value for the given state
     """
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97, use_idbd=True):
+    def __init__(self, state_dim, hidden_size=64, gamma=0.97, use_idbd=True, state_encoder=None, device=None):
         super().__init__()
         self.state_dim = state_dim
         self.gamma = gamma
         self.use_idbd = use_idbd
         self.base_lr = 1e-3
+        self.device = _resolve_device(device)
+
+        if isinstance(state_encoder, nn.Module):
+            # Store encoder without registering it as a submodule so optimizer state stays external
+            self._modules.pop('_state_encoder', None)
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
 
         # Function approximator (small MLP)
         self.net = nn.Sequential(
@@ -52,9 +69,8 @@ class GVF(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # Eligibility traces for TD(lambda)
-        self.traces = {name: torch.zeros_like(param)
-                      for name, param in self.net.named_parameters()}
+        self.to(self.device)
+        self._init_traces()
 
         # Prediction history for feature mining
         self.prediction_history = deque(maxlen=1000)
@@ -78,9 +94,17 @@ class GVF(nn.Module):
     def predict(self, state):
         """Predict value for given state"""
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if state.dim() == 1:
             state = state.unsqueeze(0)
+
+        if self._state_encoder is not None:
+            with torch.no_grad():
+                state = self._state_encoder.encode_tensor(state)
 
         with torch.no_grad():
             prediction = self.net(state).squeeze()
@@ -101,9 +125,17 @@ class GVF(nn.Module):
     def forward(self, state):
         """Forward pass (for training)"""
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if state.dim() == 1:
             state = state.unsqueeze(0)
+
+        if self._state_encoder is not None:
+            with torch.no_grad():
+                state = self._state_encoder.encode_tensor(state)
 
         prediction = self.net(state).squeeze(-1)
         return torch.clamp(prediction, -5.0, 5.0)
@@ -223,13 +255,30 @@ class GVF(nn.Module):
                 nn.init.xavier_uniform_(module.weight, gain=0.01)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        self._init_traces()
 
-    @staticmethod
-    def _feature_vector_from_state(state):
-        if isinstance(state, torch.Tensor):
-            vector = state.detach().cpu().numpy()
+    def _feature_vector_from_state(self, state):
+        if self._state_encoder is not None:
+            if isinstance(state, np.ndarray):
+                state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+            elif isinstance(state, torch.Tensor):
+                state_tensor = state.detach().to(self.device).float()
+            else:
+                state_tensor = torch.as_tensor(np.asarray(state, dtype=np.float32), device=self.device)
+
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+
+            with torch.no_grad():
+                encoded = self._state_encoder.encode_tensor(state_tensor)
+
+            vector = encoded.detach().cpu().numpy()
         else:
-            vector = np.asarray(state, dtype=np.float32)
+            if isinstance(state, torch.Tensor):
+                vector = state.detach().cpu().numpy()
+            else:
+                vector = np.asarray(state, dtype=np.float32)
+
         if vector.ndim > 1:
             vector = vector.reshape(-1)
         return vector
@@ -269,3 +318,10 @@ class GVF(nn.Module):
             return np.mean(current_grid == solution_grid)
         """
         raise NotImplementedError("Subclasses must implement compute_cumulant()")
+
+    def _init_traces(self):
+        """Initialize eligibility traces on the correct device."""
+        self.traces = {
+            name: torch.zeros_like(param, device=self.device)
+            for name, param in self.net.named_parameters()
+        }

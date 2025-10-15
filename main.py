@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 OaK Main Training Loop
 Implements the full OaK cycle with continual learning
@@ -27,6 +28,7 @@ import random
 from pathlib import Path
 
 from environments import create_environment, create_gvf_horde, load_config
+from encoders import create_state_encoder
 from replay import ReplayBuffer, TrajectoryBuffer
 from knowledge.feature_construct import FCSTOMPManager
 from models.dyn_model import DynamicsEnsemble
@@ -35,6 +37,8 @@ from models.q_primitive import DoubleQNetwork
 from models.q_option import SMDPQNetwork
 from options.library import OptionLibrary
 from planner import DynaPlanner
+from models.hierarchical_policy import HierarchicalActionHead, ArcHierarchicalQWrapper
+from models.reward_model import ArcRewardModel
 
 class OaKAgent:
     """OaK Agent with all components"""
@@ -43,11 +47,37 @@ class OaKAgent:
         self.config = config
         self.env_name = env_name
         self.use_continual_env = use_continual_env
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Create environment using factory
         env_kwargs = {}
         if env_name.lower() == 'arc':
             env_kwargs['max_steps'] = getattr(config, 'MAX_STEPS_PER_EPISODE', 50)
+            env_kwargs['max_training_examples'] = getattr(
+                config, 'ARC_MAX_TRAINING_EXAMPLES', None
+            )
+            env_kwargs['reward_mode'] = getattr(
+                config, 'ARC_REWARD_MODE', 'binary'
+            )
+            env_kwargs['working_grid_size'] = getattr(
+                config, 'ARC_WORKING_GRID_SIZE', 16
+            )
+            env_kwargs['action_stride'] = getattr(
+                config, 'ARC_ACTION_STRIDE', 3
+            )
+            env_kwargs['max_paint_actions'] = getattr(
+                config, 'ARC_MAX_PAINT_ACTIONS', 1000
+            )
+            env_kwargs['max_fill_actions'] = getattr(
+                config, 'ARC_MAX_FILL_ACTIONS', 500
+            )
+            env_kwargs['max_copy_actions'] = getattr(
+                config, 'ARC_MAX_COPY_ACTIONS', 500
+            )
+            env_kwargs['max_exemplar_actions'] = getattr(
+                config, 'ARC_MAX_EXEMPLAR_ACTIONS', 1000
+            )
+            env_kwargs['mode'] = 'train'
 
         if use_continual_env and env_name in ['cartpole', 'CartPole']:
             self.env = create_environment('cartpole_continual', regime=initial_regime)
@@ -59,6 +89,13 @@ class OaKAgent:
         else:
             self.env = create_environment(env_name, **env_kwargs)
             self.continual_metrics = None
+
+        # Shared representation encoder (CNN/attention for ARC, identity otherwise)
+        self.state_encoder = create_state_encoder(env_name, self.env, config)
+        if isinstance(self.state_encoder, torch.nn.Module):
+            self.state_encoder = self.state_encoder.to(self.device)
+        self.latent_dim = getattr(self.state_encoder, 'latent_dim', self.env.state_dim)
+        self.is_arc = env_name.lower() == 'arc'
 
         self.meta_config = None
         if not config.ABLATION_NO_IDBD:
@@ -85,7 +122,14 @@ class OaKAgent:
 
         # Knowledge layer (GVFs) - create environment-specific horde
         horde_meta = self._module_meta_config(config.GVF_META_ENABLED, config.GVF_LR)
-        self.horde = create_gvf_horde(env_name, self.env.state_dim, config, meta_config=horde_meta)
+        self.horde = create_gvf_horde(
+            env_name,
+            self.latent_dim,
+            config,
+            meta_config=horde_meta,
+            state_encoder=self.state_encoder,
+            device=self.device,
+        )
 
         # World models
         self.dyn_model = DynamicsEnsemble(
@@ -94,7 +138,10 @@ class OaKAgent:
             ensemble_size=config.DYN_ENSEMBLE_SIZE,
             hidden_size=config.DYN_HIDDEN_SIZE,
             lr=config.DYN_LR,
-            meta_config=self._module_meta_config(config.DYN_META_ENABLED, config.DYN_LR)
+            meta_config=self._module_meta_config(config.DYN_META_ENABLED, config.DYN_LR),
+            state_encoder=self.state_encoder,
+            latent_dim=self.latent_dim,
+            device=self.device,
         )
         self.option_models = OptionModelLibrary(
             state_dim=self.env.state_dim,
@@ -106,6 +153,9 @@ class OaKAgent:
                 config.OPTION_MODEL_META_ENABLED,
                 config.OPTION_MODEL_LR,
             ),
+            state_encoder=self.state_encoder,
+            latent_dim=self.latent_dim,
+            device=self.device,
         )
 
         # Options
@@ -122,13 +172,88 @@ class OaKAgent:
             action_dim=self.env.action_dim,
             gamma=config.Q_GAMMA,
             target_sync_freq=config.Q_TARGET_SYNC_FREQ,
-            meta_config=self.meta_config
+            meta_config=self.meta_config,
+            state_encoder=self.state_encoder,
+            latent_dim=self.latent_dim,
+            device=self.device,
         )
+        if self.is_arc:
+            self.hierarchical_action_head = HierarchicalActionHead(self.state_encoder, self.env)
+            self.hierarchical_action_head = self.hierarchical_action_head.to(self.device)
+            self.q_primitive = ArcHierarchicalQWrapper(self.q_primitive, self.hierarchical_action_head, self.env)
+            reward_lr = getattr(config, 'ARC_REWARD_MODEL_LR', 1e-3)
+            self.reward_model = ArcRewardModel(self.latent_dim, lr=reward_lr).to(self.device)
+            from environments.arc.options import (
+                FillRegionOption,
+                SymmetrizeOption,
+                ReduceEntropyOption,
+                CopyPatternOption,
+                MatchSolutionOption,
+            )
+            base_options = []
+            exemplar_cap = int(getattr(self.env, 'max_training_examples', 1))
+            for exemplar_idx in range(exemplar_cap):
+                base_options.extend([
+                    FillRegionOption(
+                        -1,
+                        f'fill_ex{exemplar_idx}',
+                        self.env.state_dim,
+                        self.env.action_dim,
+                        exemplar_idx=exemplar_idx,
+                        max_training_examples=self.env.max_training_examples,
+                        spatial_feature_dim=getattr(self.env, '_spatial_feature_dim', 0),
+                    ),
+                    SymmetrizeOption(
+                        -1,
+                        f'symm_ex{exemplar_idx}',
+                        self.env.state_dim,
+                        self.env.action_dim,
+                        exemplar_idx=exemplar_idx,
+                        max_training_examples=self.env.max_training_examples,
+                        spatial_feature_dim=getattr(self.env, '_spatial_feature_dim', 0),
+                    ),
+                    ReduceEntropyOption(
+                        -1,
+                        f'entropy_ex{exemplar_idx}',
+                        self.env.state_dim,
+                        self.env.action_dim,
+                        exemplar_idx=exemplar_idx,
+                        max_training_examples=self.env.max_training_examples,
+                        spatial_feature_dim=getattr(self.env, '_spatial_feature_dim', 0),
+                    ),
+                    CopyPatternOption(
+                        -1,
+                        f'copy_ex{exemplar_idx}',
+                        self.env.state_dim,
+                        self.env.action_dim,
+                        exemplar_idx=exemplar_idx,
+                        max_training_examples=self.env.max_training_examples,
+                        spatial_feature_dim=getattr(self.env, '_spatial_feature_dim', 0),
+                    ),
+                    MatchSolutionOption(
+                        -1,
+                        f'match_ex{exemplar_idx}',
+                        self.env.state_dim,
+                        self.env.action_dim,
+                        exemplar_idx=exemplar_idx,
+                        max_training_examples=self.env.max_training_examples,
+                        spatial_feature_dim=getattr(self.env, '_spatial_feature_dim', 0),
+                    ),
+                ])
+            for option in base_options:
+                option_id, is_new = self.option_library.add_option(option)
+                if is_new:
+                    self.option_models.add_option(option_id)
+        else:
+            self.reward_model = None
         self.q_option = SMDPQNetwork(
-            state_dim=self.env.state_dim,
+            state_dim=self.latent_dim,
             num_options=self.option_library.get_num_options(),
             gamma=config.Q_GAMMA,
-            meta_config=self.meta_config
+            meta_config=self.meta_config,
+            state_encoder=self.state_encoder,
+            latent_dim=self.latent_dim,
+            device=self.device,
         )
 
         # Planner
@@ -173,10 +298,33 @@ class OaKAgent:
         self.arc_test_tasks = None
         if self.env_name.lower() == 'arc':
             self._initialize_arc_tasks()
+            if hasattr(self.env, 'set_mode'):
+                self.env.set_mode('train')
+
+    def _compute_shaped_reward(self, state, next_state, env_reward, info):
+        if not self.is_arc or self.reward_model is None:
+            return env_reward, 0.0
+
+        state_latent_np = self.state_encoder.encode_numpy(state)
+        next_latent_np = self.state_encoder.encode_numpy(next_state)
+        state_latent = torch.as_tensor(state_latent_np, dtype=torch.float32, device=self.device)
+        next_latent = torch.as_tensor(next_latent_np, dtype=torch.float32, device=self.device)
+
+        shaping = self.reward_model.shaping(state_latent, next_latent)
+        total_reward = float(env_reward + shaping)
+
+        target_progress = info.get('grid_match_ratio') if info else None
+        if target_progress is not None and np.isfinite(target_progress):
+            target_tensor = torch.tensor([target_progress], dtype=torch.float32, device=self.device)
+            self.reward_model.update(next_latent, target_tensor)
+
+        return total_reward, shaping
 
     def train(self, num_episodes):
         """Main training loop"""
         for episode in range(num_episodes):
+            if hasattr(self.env, 'set_mode'):
+                self.env.set_mode('train')
             episode_return = 0
             episode_length = 0
             episode_option_counts = defaultdict(int)
@@ -242,6 +390,7 @@ class OaKAgent:
                         # Fallback: execute a primitive action if option couldn't start
                         action = self.q_primitive.select_action(state, epsilon=self.epsilon)
                         next_state, reward, done, info = self.env.step(action)
+                        reward, _ = self._compute_shaped_reward(state, next_state, reward, info)
                         self.rb_real.add(state, action, reward, next_state, done)
                         self.state_history.append(state)
                         self.action_history.append(action)
@@ -252,6 +401,7 @@ class OaKAgent:
                 else:
                     # Execute primitive action
                     next_state, reward, done, info = self.env.step(action_or_option)
+                    reward, _ = self._compute_shaped_reward(state, next_state, reward, info)
 
                     # Store transition
                     self.rb_real.add(state, action_or_option, reward, next_state, done)
@@ -522,6 +672,7 @@ class OaKAgent:
                     else:
                         action = self.q_primitive.select_action(state, epsilon=self.epsilon)
                         next_state, reward, done, info = self.env.step(action)
+                        reward, _ = self._compute_shaped_reward(state, next_state, reward, info)
                         self.rb_real.add(state, action, reward, next_state, done)
                         self.state_history.append(state)
                         self.action_history.append(action)
@@ -532,6 +683,7 @@ class OaKAgent:
                 else:
                     action = self.q_primitive.select_action(state, epsilon=self.epsilon)
                     next_state, reward, done, info = self.env.step(action)
+                    reward, _ = self._compute_shaped_reward(state, next_state, reward, info)
                     self.rb_real.add(state, action, reward, next_state, done)
                     self.state_history.append(state)
                     self.action_history.append(action)
@@ -850,44 +1002,53 @@ class OaKAgent:
         """
         total_return = 0.0
 
-        for _ in range(num_episodes):
-            if self.env_name.lower() == 'arc':
-                self._prepare_arc_task(for_eval=True)
-            state = self.env.reset()
-            done = False
-            episode_return = 0
-            steps = 0
+        restore_mode = None
+        if hasattr(self.env, 'set_mode'):
+            restore_mode = getattr(self.env, 'mode', None)
+            self.env.set_mode('eval')
 
-            while not done and steps < self.config.MAX_STEPS_PER_EPISODE:
-                # Greedy action (no exploration during eval)
-                action, is_option = self.planner.plan_and_act(state, epsilon=0.0)
+        try:
+            for _ in range(num_episodes):
+                if self.env_name.lower() == 'arc':
+                    self._prepare_arc_task(for_eval=True)
+                state = self.env.reset()
+                done = False
+                episode_return = 0
+                steps = 0
 
-                if is_option:
-                    trajectory, _ = self.option_library.execute_option(action, self.env)
-                    if len(trajectory) > 0:
-                        episode_return += sum([t[2] for t in trajectory])
-                        state = trajectory[-1][3]
-                        done = trajectory[-1][4]
-                        steps += len(trajectory)
+                while not done and steps < self.config.MAX_STEPS_PER_EPISODE:
+                    # Greedy action (no exploration during eval)
+                    action, is_option = self.planner.plan_and_act(state, epsilon=0.0)
+
+                    if is_option:
+                        trajectory, _ = self.option_library.execute_option(action, self.env)
+                        if len(trajectory) > 0:
+                            episode_return += sum([t[2] for t in trajectory])
+                            state = trajectory[-1][3]
+                            done = trajectory[-1][4]
+                            steps += len(trajectory)
+
+                            # Continue learning if OaK purity enabled
+                            if continual_learning:
+                                for trans in trajectory:
+                                    self.rb_real.add(*trans)
+                                self._update_all_components()
+                    else:
+                        next_state, reward, done, _ = self.env.step(action)
+                        episode_return += reward
 
                         # Continue learning if OaK purity enabled
                         if continual_learning:
-                            for trans in trajectory:
-                                self.rb_real.add(*trans)
+                            self.rb_real.add(state, action, reward, next_state, done)
                             self._update_all_components()
-                else:
-                    next_state, reward, done, _ = self.env.step(action)
-                    episode_return += reward
 
-                    # Continue learning if OaK purity enabled
-                    if continual_learning:
-                        self.rb_real.add(state, action, reward, next_state, done)
-                        self._update_all_components()
+                        state = next_state
+                        steps += 1
 
-                    state = next_state
-                    steps += 1
-
-            total_return += episode_return
+                total_return += episode_return
+        finally:
+            if restore_mode is not None:
+                self.env.set_mode(restore_mode or 'train')
 
         return total_return / num_episodes
 

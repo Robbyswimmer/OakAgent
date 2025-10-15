@@ -10,16 +10,34 @@ import torch.nn.functional as F
 
 from meta.meta_optimizer import MetaOptimizerAdapter
 
+
+def _resolve_device(device):
+    if device is None:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
 class DynamicsNet(nn.Module):
     """Single dynamics model: (s, a) -> (Δs, r)"""
 
-    def __init__(self, state_dim, action_dim, hidden_size=128):
+    def __init__(self, state_dim, action_dim, latent_dim=None, hidden_size=128, state_encoder=None, device=None):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.device = _resolve_device(device)
+        if isinstance(state_encoder, nn.Module):
+            self._modules.pop('_state_encoder', None)
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
+
+        if latent_dim is None:
+            latent_dim = state_dim
+        self.latent_dim = latent_dim
 
         # Input: state + action (one-hot)
-        input_dim = state_dim + action_dim
+        input_dim = latent_dim + action_dim
 
         # Shared layers
         self.shared = nn.Sequential(
@@ -35,6 +53,8 @@ class DynamicsNet(nn.Module):
         # Reward head
         self.reward_head = nn.Linear(hidden_size, 1)
 
+        self.to(self.device)
+
     def forward(self, state, action):
         """
         Args:
@@ -45,6 +65,20 @@ class DynamicsNet(nn.Module):
             delta_state: (batch, state_dim)
             reward: (batch, 1)
         """
+        if isinstance(state, np.ndarray):
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+
+        if isinstance(action, np.ndarray):
+            action = torch.as_tensor(action, device=self.device)
+        elif isinstance(action, torch.Tensor):
+            action = action.to(self.device)
+        else:
+            action = torch.as_tensor(action, device=self.device)
+
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
@@ -60,8 +94,14 @@ class DynamicsNet(nn.Module):
             # Already one-hot (batch, action_dim)
             action_onehot = action.float()
 
-        # Concatenate state and action
-        x = torch.cat([state, action_onehot], dim=-1)
+        if self._state_encoder is not None:
+            with torch.no_grad():
+                encoded_state = self._state_encoder.encode_tensor(state)
+        else:
+            encoded_state = state
+
+        # Concatenate encoded state and action
+        x = torch.cat([encoded_state, action_onehot], dim=-1)
 
         # Forward pass
         features = self.shared(x)
@@ -72,8 +112,15 @@ class DynamicsNet(nn.Module):
 
     def predict(self, state, action):
         """Predict next state and reward"""
-        delta_s, r = self.forward(state, action)
-        next_state = state + delta_s
+        if isinstance(state, np.ndarray):
+            state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state_tensor = state.to(self.device)
+        else:
+            state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+
+        delta_s, r = self.forward(state_tensor, action)
+        next_state = state_tensor + delta_s
         return next_state, r
 
 
@@ -83,14 +130,28 @@ class DynamicsEnsemble:
     Predicts p(s', r | s, a) via ensemble mean/variance
     """
 
-    def __init__(self, state_dim, action_dim, ensemble_size=3, hidden_size=128, lr=1e-3, meta_config=None):
+    def __init__(self, state_dim, action_dim, ensemble_size=3, hidden_size=128, lr=1e-3,
+                 meta_config=None, state_encoder=None, latent_dim=None, device=None):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.ensemble_size = ensemble_size
+        self._state_encoder = state_encoder
+        self.device = _resolve_device(device)
+
+        if latent_dim is None:
+            latent_dim = state_dim
+        self.latent_dim = latent_dim
 
         # Create ensemble
         self.models = [
-            DynamicsNet(state_dim, action_dim, hidden_size)
+            DynamicsNet(
+                state_dim,
+                action_dim,
+                latent_dim=latent_dim,
+                hidden_size=hidden_size,
+                state_encoder=state_encoder,
+                device=self.device,
+            )
             for _ in range(ensemble_size)
         ]
 
@@ -99,11 +160,13 @@ class DynamicsEnsemble:
         # Optimizers for each model
         self.optimizers = [
             MetaOptimizerAdapter(model.parameters(), base_lr=lr, meta_config=meta_cfg)
-            for model in self.models
+        for model in self.models
         ]
 
         # Track prediction errors
         self.prediction_errors = []
+
+        self.to(self.device)
 
     def predict(self, state, action, return_std=False):
         """
@@ -118,11 +181,20 @@ class DynamicsEnsemble:
             next_state_mean, reward_mean [, next_state_std, reward_std]
         """
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+
         if isinstance(action, (int, np.integer)):
-            action = torch.LongTensor([action])
+            action = torch.tensor([action], dtype=torch.long, device=self.device)
         elif isinstance(action, np.ndarray):
-            action = torch.LongTensor(action)
+            action = torch.as_tensor(action, dtype=torch.long, device=self.device)
+        elif isinstance(action, torch.Tensor):
+            action = action.to(self.device)
+        else:
+            action = torch.as_tensor(action, dtype=torch.long, device=self.device)
 
         predictions = []
         rewards = []
@@ -163,13 +235,29 @@ class DynamicsEnsemble:
             average loss across ensemble
         """
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if isinstance(action, np.ndarray):
-            action = torch.LongTensor(action)
+            action = torch.as_tensor(action, dtype=torch.long, device=self.device)
+        elif isinstance(action, torch.Tensor):
+            action = action.to(self.device)
+        else:
+            action = torch.as_tensor(action, dtype=torch.long, device=self.device)
         if isinstance(next_state, np.ndarray):
-            next_state = torch.FloatTensor(next_state)
+            next_state = torch.as_tensor(next_state, dtype=torch.float32, device=self.device)
+        elif isinstance(next_state, torch.Tensor):
+            next_state = next_state.to(self.device)
+        else:
+            next_state = torch.as_tensor(next_state, dtype=torch.float32, device=self.device)
         if isinstance(reward, np.ndarray):
-            reward = torch.FloatTensor(reward)
+            reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
+        elif isinstance(reward, torch.Tensor):
+            reward = reward.to(self.device)
+        else:
+            reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
 
         if state.dim() == 1:
             state = state.unsqueeze(0)
@@ -197,7 +285,12 @@ class DynamicsEnsemble:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            feature_vec = state.detach().cpu().numpy().reshape(-1)
+            if self._state_encoder is not None:
+                with torch.no_grad():
+                    encoded_state = self._state_encoder.encode_tensor(state)
+                feature_vec = encoded_state.detach().cpu().numpy().reshape(-1)
+            else:
+                feature_vec = state.detach().cpu().numpy().reshape(-1)
             optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
 
             total_loss += loss.item()
@@ -259,3 +352,9 @@ class DynamicsEnsemble:
             'count_1': batch_size,
             'count_3': len(multi_errors),
         }
+
+    def to(self, device):
+        self.device = _resolve_device(device)
+        for model in self.models:
+            model.to(self.device)
+        return self

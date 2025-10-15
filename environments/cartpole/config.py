@@ -7,6 +7,7 @@ import math
 class Config:
     # Environment
     ENV_NAME = "CartPole-v1"
+    ENCODER_LATENT_DIM = 4  # Identity encoder keeps vector features
 
     # Primitive Dynamics Model
     DYN_HIDDEN_SIZE = 128

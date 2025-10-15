@@ -10,8 +10,8 @@ from knowledge.gvf import GVF
 class UprignessGVF(GVF):
     """g1: Predicts E[|theta|] - how upright the pole is"""
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=64, gamma=0.97, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "uprightness"
         self.theta_max = 0.2095  # ~12 degrees (CartPole termination threshold)
 
@@ -27,8 +27,8 @@ class UprignessGVF(GVF):
 class CenteringGVF(GVF):
     """g2: Predicts E[|x|] - how centered the cart is"""
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=64, gamma=0.97, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "centering"
         self.x_max = 2.4  # CartPole termination threshold
 
@@ -44,8 +44,8 @@ class CenteringGVF(GVF):
 class StabilityGVF(GVF):
     """g3: Predicts E[|theta_dot| + |x_dot|] - velocity stability"""
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.97):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=64, gamma=0.97, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "stability"
         self.velocity_scale = 5.0  # Empirical max for |theta_dot| + |x_dot|
 
@@ -64,8 +64,8 @@ class StabilityGVF(GVF):
 class SurvivalGVF(GVF):
     """g4: Predicts E[time-to-failure] - survival horizon"""
 
-    def __init__(self, state_dim, hidden_size=64, gamma=0.99, horizon=200.0):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=64, gamma=0.99, horizon=200.0, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "survival"
         self.horizon = horizon
 
@@ -80,19 +80,21 @@ class CartPoleHordeGVFs:
     Updates all GVFs in parallel (OaK continual learning)
     """
 
-    def __init__(self, state_dim, config, meta_config=None):
+    def __init__(self, state_dim, config, meta_config=None, state_encoder=None, device=None):
         self.state_dim = state_dim
 
         # Create the 4 core GVFs for CartPole
         self.gvfs = {
-            'uprightness': UprignessGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'centering': CenteringGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
-            'stability': StabilityGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT),
+            'uprightness': UprignessGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT, state_encoder=state_encoder, device=device),
+            'centering': CenteringGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT, state_encoder=state_encoder, device=device),
+            'stability': StabilityGVF(state_dim, config.GVF_HIDDEN_SIZE, config.GVF_GAMMA_SHORT, state_encoder=state_encoder, device=device),
             'survival': SurvivalGVF(
                 state_dim,
                 config.GVF_HIDDEN_SIZE,
                 config.GVF_GAMMA_LONG,
                 horizon=getattr(config, 'FC_SURVIVAL_TARGET', 200.0),
+                state_encoder=state_encoder,
+                device=device,
             ),
         }
 

@@ -41,7 +41,7 @@ def create_environment(env_name: str, **kwargs):
         )
 
 
-def create_gvf_horde(env_name: str, state_dim: int, config: Any, meta_config: Any = None):
+def create_gvf_horde(env_name: str, state_dim: int, config: Any, meta_config: Any = None, state_encoder=None, device=None):
     """
     Create environment-specific GVF Horde.
 
@@ -59,11 +59,11 @@ def create_gvf_horde(env_name: str, state_dim: int, config: Any, meta_config: An
     """
     if env_name in ['cartpole', 'CartPole', 'cartpole-v1', 'cartpole_continual', 'continual_cartpole']:
         from environments.cartpole.gvfs import CartPoleHordeGVFs
-        return CartPoleHordeGVFs(state_dim, config, meta_config)
+        return CartPoleHordeGVFs(state_dim, config, meta_config, state_encoder=state_encoder, device=device)
 
     elif env_name in ['arc', 'ARC']:
         from environments.arc.gvfs import ARCHordeGVFs
-        return ARCHordeGVFs(state_dim, config, meta_config)
+        return ARCHordeGVFs(state_dim, config, meta_config, state_encoder=state_encoder, device=device)
 
     else:
         raise ValueError(

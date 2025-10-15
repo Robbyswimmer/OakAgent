@@ -10,13 +10,27 @@ import torch.nn.functional as F
 
 from meta.idbd import TorchIDBD
 
-class QNetwork(nn.Module):
-    """Q-network for primitive actions"""
 
-    def __init__(self, state_dim, action_dim, hidden_size=128):
+def _resolve_device(device):
+    if device is None:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
+class QNetwork(nn.Module):
+    """Q-network for primitive actions with optional state encoder"""
+
+    def __init__(self, state_dim, action_dim, hidden_size=128, state_encoder=None, device=None):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.device = _resolve_device(device)
+        if isinstance(state_encoder, nn.Module):
+            self._modules.pop('_state_encoder', None)
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
@@ -25,6 +39,8 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, action_dim)
         )
+
+        self.to(self.device)
 
     def forward(self, state):
         """
@@ -35,13 +51,23 @@ class QNetwork(nn.Module):
             q_values: (batch, action_dim) or (action_dim,)
         """
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
         if state.dim() == 1:
             state = state.unsqueeze(0)
-            return self.net(state).squeeze(0)
 
-        return self.net(state)
+        if self._state_encoder is not None:
+            with torch.no_grad():
+                state = self._state_encoder.encode_tensor(state)
+
+        output = self.net(state)
+        if output.dim() == 2 and output.size(0) == 1:
+            return output.squeeze(0)
+        return output
 
 
 class DoubleQNetwork:
@@ -58,11 +84,20 @@ class DoubleQNetwork:
         lr=1e-3,
         target_sync_freq=500,
         meta_config=None,
+        state_encoder=None,
+        latent_dim=None,
+        device=None,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.gamma = gamma
         self.target_sync_freq = target_sync_freq
+        self._state_encoder = state_encoder
+        self.device = _resolve_device(device)
+
+        if latent_dim is None:
+            latent_dim = state_dim
+        self.latent_dim = latent_dim
 
         self.meta_config = meta_config or {}
         self.use_meta = meta_config is not None and not self.meta_config.get(
@@ -71,8 +106,8 @@ class DoubleQNetwork:
         self.base_lr = lr
 
         # Q-network and target network
-        self.q_net = QNetwork(state_dim, action_dim)
-        self.target_net = QNetwork(state_dim, action_dim)
+        self.q_net = QNetwork(latent_dim, action_dim, state_encoder=state_encoder, device=self.device)
+        self.target_net = QNetwork(latent_dim, action_dim, state_encoder=state_encoder, device=self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
 
         # Optimizer / meta-learner
@@ -123,15 +158,35 @@ class DoubleQNetwork:
         """
         # Convert to tensors
         if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state)
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         if isinstance(action, np.ndarray):
-            action = torch.LongTensor(action)
+            action = torch.as_tensor(action, dtype=torch.long, device=self.device)
+        elif isinstance(action, torch.Tensor):
+            action = action.to(self.device)
+        else:
+            action = torch.as_tensor(action, dtype=torch.long, device=self.device)
         if isinstance(reward, np.ndarray):
-            reward = torch.FloatTensor(reward)
+            reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
+        elif isinstance(reward, torch.Tensor):
+            reward = reward.to(self.device)
+        else:
+            reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device)
         if isinstance(next_state, np.ndarray):
-            next_state = torch.FloatTensor(next_state)
+            next_state = torch.as_tensor(next_state, dtype=torch.float32, device=self.device)
+        elif isinstance(next_state, torch.Tensor):
+            next_state = next_state.to(self.device)
+        else:
+            next_state = torch.as_tensor(next_state, dtype=torch.float32, device=self.device)
         if isinstance(done, np.ndarray):
-            done = torch.FloatTensor(done)
+            done = torch.as_tensor(done, dtype=torch.float32, device=self.device)
+        elif isinstance(done, torch.Tensor):
+            done = done.to(self.device)
+        else:
+            done = torch.as_tensor(done, dtype=torch.float32, device=self.device)
 
         # Ensure batch dimension
         if state.dim() == 1:
@@ -174,7 +229,12 @@ class DoubleQNetwork:
             self.q_net.zero_grad(set_to_none=True)
             loss.backward()
             gradients = [param.grad for param in self.q_net.parameters()]
-            step_sizes = self.meta_updater.update_step_sizes(gradients, state)
+            if self._state_encoder is not None:
+                with torch.no_grad():
+                    feature_state = self._state_encoder.encode_tensor(state)
+            else:
+                feature_state = state
+            step_sizes = self.meta_updater.update_step_sizes(gradients, feature_state)
             self.meta_updater.apply_updates(self.q_net.parameters(), step_sizes)
             self.q_net.zero_grad(set_to_none=True)
         else:
@@ -196,6 +256,12 @@ class DoubleQNetwork:
     def sync_target(self):
         """Synchronize target network with Q-network"""
         self.target_net.load_state_dict(self.q_net.state_dict())
+
+    def to(self, device):
+        self.device = _resolve_device(device)
+        self.q_net.to(self.device)
+        self.target_net.to(self.device)
+        return self
 
     def get_average_td_error(self, n=100):
         """Get average TD error over last n updates"""

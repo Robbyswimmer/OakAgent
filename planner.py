@@ -153,7 +153,7 @@ class DynaPlanner:
 
         # Greedy selection based on Q-values
         q_primitive_values = self.q_primitive.predict(state)
-        best_primitive_action = np.argmax(q_primitive_values)
+        best_primitive_action = self.q_primitive.select_action(state, epsilon=0.0)
         best_primitive_q = q_primitive_values[best_primitive_action]
 
         # Check option Q-values

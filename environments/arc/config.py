@@ -11,6 +11,19 @@ class ARCConfig:
     MAX_GRID_SIZE = 30  # ARC grids up to 30×30
     NUM_COLORS = 10     # Colors 0-9
     MAX_EPISODE_STEPS = 50  # Steps per episode
+    ARC_MAX_TRAINING_EXAMPLES = 7
+    ARC_REWARD_MODE = 'binary'
+    ARC_WORKING_GRID_SIZE = 16
+    ARC_ACTION_STRIDE = 3
+    ARC_MAX_PAINT_ACTIONS = 1000
+    ARC_MAX_FILL_ACTIONS = 500
+    ARC_MAX_COPY_ACTIONS = 500
+    ARC_MAX_EXEMPLAR_ACTIONS = 1000
+    ARC_ACTION_COMPONENT_DIM = 6
+    ARC_REWARD_MODEL_LR = 1e-3
+    ENCODER_LATENT_DIM = 256
+    ENCODER_NUM_HEADS = 4
+    ENCODER_NUM_LAYERS = 2
 
     # Primitive Dynamics Model
     DYN_HIDDEN_SIZE = 256  # Larger for complex transformations

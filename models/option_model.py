@@ -10,21 +10,42 @@ import torch.nn.functional as F
 
 from meta.meta_optimizer import MetaOptimizerAdapter
 
+
+def _resolve_device(device):
+    if device is None:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
 class OptionModel(nn.Module):
     """
-    SMDP model for a single option
-    Predicts: (Δs, R_total, duration) from start state
+    SMDP model for a single option.
+    Predicts Δs, cumulative reward, and duration from start state embeddings.
     """
 
-    def __init__(self, state_dim, hidden_size=128):
+    def __init__(self, state_dim, hidden_size=128, latent_dim=None, state_encoder=None, device=None):
         super().__init__()
         self.state_dim = state_dim
+        self.device = _resolve_device(device)
+        if isinstance(state_encoder, nn.Module):
+            self._modules.pop('_state_encoder', None)
+            object.__setattr__(self, '_state_encoder', state_encoder)
+        else:
+            self._state_encoder = state_encoder
+
+        if latent_dim is None:
+            latent_dim = state_dim
+        self.latent_dim = latent_dim
+        self.input_adapter = None
+        if self.latent_dim != state_dim:
+            self.input_adapter = nn.Linear(state_dim, self.latent_dim)
 
         self.state_bounds = None  # set dynamically based on environment
 
         # Shared layers with smaller initialization
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
+            nn.Linear(latent_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
@@ -37,6 +58,7 @@ class OptionModel(nn.Module):
 
         # Initialize with small weights to prevent initial explosion
         self._initialize_weights()
+        self.to(self.device)
 
     def _initialize_weights(self):
         """Initialize with small weights to prevent prediction explosion"""
@@ -54,6 +76,13 @@ class OptionModel(nn.Module):
         Returns:
             delta_state, total_reward, duration
         """
+        if isinstance(state, np.ndarray):
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        elif isinstance(state, torch.Tensor):
+            state = state.to(self.device)
+        else:
+            state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+
         if state.dim() == 1:
             state = state.unsqueeze(0)
 
@@ -64,7 +93,21 @@ class OptionModel(nn.Module):
             bounds = torch.where(bounds != 0, bounds, torch.ones_like(bounds))
             state_normalized = state_normalized / bounds
 
-        features = self.shared(state_normalized)
+        encoder = getattr(self, "_state_encoder", None)
+        if encoder is not None:
+            with torch.no_grad():
+                encoded = encoder.encode_tensor(state_normalized)
+        else:
+            encoded = state_normalized
+
+        if encoded.dim() == 1:
+            encoded = encoded.unsqueeze(0)
+        if encoded.shape[-1] != self.latent_dim:
+            if self.input_adapter is None or self.input_adapter.in_features != encoded.shape[-1]:
+                self.input_adapter = nn.Linear(encoded.shape[-1], self.latent_dim).to(encoded.device)
+            encoded = self.input_adapter(encoded)
+
+        features = self.shared(encoded)
 
         # Predict delta in normalized space, then denormalize
         delta_normalized = self.delta_head(features)
@@ -91,15 +134,21 @@ class OptionModel(nn.Module):
         """Predict SMDP outcome: (s', R, τ)"""
         with torch.no_grad():
             if isinstance(state, np.ndarray):
-                state = torch.FloatTensor(state)
+                state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+            elif isinstance(state, torch.Tensor):
+                state_tensor = state.to(self.device)
+            else:
+                state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
-            delta_s, R, tau = self.forward(state)
-            next_state = state + delta_s
+            delta_s, R, tau = self.forward(state_tensor)
+            next_state = state_tensor + delta_s
 
-            # Clip next state to reasonable bounds
-            state_bounds_np = self.state_bounds.cpu().numpy()
-            next_state_np = next_state.squeeze().cpu().numpy()
-            next_state_np = np.clip(next_state_np, -state_bounds_np, state_bounds_np)
+            if self.state_bounds is not None:
+                state_bounds_np = self.state_bounds.cpu().numpy()
+                next_state_np = next_state.squeeze().cpu().numpy()
+                next_state_np = np.clip(next_state_np, -state_bounds_np, state_bounds_np)
+            else:
+                next_state_np = next_state.squeeze().cpu().numpy()
 
             return (
                 next_state_np,
@@ -122,6 +171,9 @@ class OptionModelLibrary:
         min_rollouts=5,
         error_threshold=None,
         meta_config=None,
+        state_encoder=None,
+        latent_dim=None,
+        device=None,
     ):
         self.state_dim = state_dim
         self.hidden_size = hidden_size
@@ -129,6 +181,9 @@ class OptionModelLibrary:
         self.min_rollouts = min_rollouts
         self.error_threshold = error_threshold
         self.meta_config = meta_config.copy() if meta_config is not None else None
+        self.state_encoder = state_encoder
+        self.latent_dim = latent_dim if latent_dim is not None else state_dim
+        self.device = _resolve_device(device)
 
         # Dictionary: option_id -> (model, optimizer)
         self.models = {}
@@ -137,10 +192,16 @@ class OptionModelLibrary:
 
     def add_option(self, option_id):
         """Add a new option model"""
-        model = OptionModel(self.state_dim, self.hidden_size)
+        model = OptionModel(
+            self.state_dim,
+            self.hidden_size,
+            latent_dim=self.latent_dim,
+            state_encoder=self.state_encoder,
+            device=self.device,
+        )
         if self.state_dim <= 4:
             # Default bounds suitable for CartPole-like state vectors
-            model.state_bounds = torch.FloatTensor([2.4, 3.0, 0.21, 3.0])
+            model.state_bounds = torch.tensor([2.4, 3.0, 0.21, 3.0], dtype=torch.float32, device=self.device)
         else:
             model.state_bounds = None  # Unbounded for high-dimensional states like ARC
         optimizer = MetaOptimizerAdapter(model.parameters(), base_lr=self.lr, meta_config=self.meta_config)
@@ -187,9 +248,17 @@ class OptionModelLibrary:
 
         # Convert to tensors
         if isinstance(s_start, np.ndarray):
-            s_start = torch.FloatTensor(s_start)
+            s_start = torch.as_tensor(s_start, dtype=torch.float32, device=self.device)
+        elif isinstance(s_start, torch.Tensor):
+            s_start = s_start.to(self.device)
+        else:
+            s_start = torch.as_tensor(s_start, dtype=torch.float32, device=self.device)
         if isinstance(s_end, np.ndarray):
-            s_end = torch.FloatTensor(s_end)
+            s_end = torch.as_tensor(s_end, dtype=torch.float32, device=self.device)
+        elif isinstance(s_end, torch.Tensor):
+            s_end = s_end.to(self.device)
+        else:
+            s_end = torch.as_tensor(s_end, dtype=torch.float32, device=self.device)
 
         if s_start.dim() == 1:
             s_start = s_start.unsqueeze(0)
@@ -197,8 +266,8 @@ class OptionModelLibrary:
 
         # Target values (use TRUE transitions, don't clip)
         target_delta = s_end - s_start
-        target_reward = torch.FloatTensor([[R_total]])
-        target_duration = torch.FloatTensor([[duration]])
+        target_reward = torch.tensor([[R_total]], dtype=torch.float32, device=self.device)
+        target_duration = torch.tensor([[duration]], dtype=torch.float32, device=self.device)
 
         # Only clip duration to reasonable bounds (rewards and deltas should be learned as-is)
         target_duration = torch.clamp(target_duration, 1.0, 20.0)
@@ -230,7 +299,12 @@ class OptionModelLibrary:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # tighter clipping
 
-        feature_vec = s_start.detach().cpu().numpy().reshape(-1)
+        if self.state_encoder is not None:
+            with torch.no_grad():
+                encoded_state = self.state_encoder.encode_tensor(s_start)
+            feature_vec = encoded_state.detach().cpu().numpy().reshape(-1)
+        else:
+            feature_vec = s_start.detach().cpu().numpy().reshape(-1)
         optimizer.step(feature_vec, clip_range=(-10.0, 10.0))
 
         # Track error
@@ -284,3 +358,11 @@ class OptionModelLibrary:
 
         avg_error = self.get_average_error(option_id, n=self.min_rollouts)
         return avg_error <= self.error_threshold
+
+    def to(self, device):
+        self.device = _resolve_device(device)
+        for option_id, (model, _) in self.models.items():
+            model.to(self.device)
+            if model.state_bounds is not None:
+                model.state_bounds = model.state_bounds.to(self.device)
+        return self

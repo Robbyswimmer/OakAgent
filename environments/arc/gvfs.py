@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 ARC-Specific GVF Definitions
 Predictive knowledge layer for ARC domain
@@ -17,8 +18,8 @@ from knowledge.gvf import GVF
 class GridSimilarityGVF(GVF):
     """g1: Predicts E[similarity to solution] - how close grid is to target"""
 
-    def __init__(self, state_dim, hidden_size=128, gamma=0.95):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=128, gamma=0.95, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "grid_similarity"
 
     def compute_cumulant(self, state):
@@ -30,7 +31,7 @@ class GridSimilarityGVF(GVF):
         For now, we assume it's encoded in the state or available via info dict.
         """
         if isinstance(state, np.ndarray) and state.size > 0:
-            match_ratio = float(state[-1])
+            match_ratio = float(state[-4])
             return max(0.0, min(1.0, match_ratio))
         return 0.0
 
@@ -38,8 +39,8 @@ class GridSimilarityGVF(GVF):
 class EntropyGVF(GVF):
     """g2: Predicts E[grid entropy] - complexity/disorder of grid"""
 
-    def __init__(self, state_dim, hidden_size=128, gamma=0.95):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=128, gamma=0.95, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "entropy"
         self.max_entropy = math.log(10)  # Maximum entropy for 10 colors
 
@@ -49,28 +50,16 @@ class EntropyGVF(GVF):
 
         Grid entropy indicates complexity - higher entropy = more diverse colors
         """
-        if isinstance(state, np.ndarray):
-            # Extract grid from state (first 900 elements for 30x30 grid)
-            grid_size = 30 * 30
-            if len(state) >= grid_size:
-                grid = state[:grid_size].reshape(30, 30)
-
-                # Compute entropy
-                unique, counts = np.unique(grid, return_counts=True)
-                probs = counts / counts.sum()
-                entropy = -np.sum(probs * np.log(probs + 1e-8))
-
-                # Normalize by max entropy
-                return min(entropy / self.max_entropy, 1.0)
-
-        return 0.5  # Default
+        if isinstance(state, np.ndarray) and state.size > 3:
+            return float(np.clip(state[-3], 0.0, 1.0))
+        return 0.0
 
 
 class ObjectCountGVF(GVF):
     """g3: Predicts E[num_objects] - number of distinct objects/regions"""
 
-    def __init__(self, state_dim, hidden_size=128, gamma=0.95):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=128, gamma=0.95, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "object_count"
         self.max_objects = 50  # Assume max 50 objects in a grid
 
@@ -80,26 +69,16 @@ class ObjectCountGVF(GVF):
 
         Simplified: Count non-zero cells as proxy for object presence
         """
-        if isinstance(state, np.ndarray):
-            # Extract grid from state
-            grid_size = 30 * 30
-            if len(state) >= grid_size:
-                grid = state[:grid_size].reshape(30, 30)
-
-                # Count non-zero cells
-                object_cells = np.sum(grid > 0)
-
-                # Normalize by max possible objects
-                return min(object_cells / (self.max_objects * 4), 1.0)  # *4 for cell size
-
-        return 0.5  # Default
+        if isinstance(state, np.ndarray) and state.size > 2:
+            return float(np.clip(state[-2], 0.0, 1.0))
+        return 0.0
 
 
 class SymmetryGVF(GVF):
     """g4: Predicts E[symmetry] - horizontal/vertical symmetry of grid"""
 
-    def __init__(self, state_dim, hidden_size=128, gamma=0.95):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=128, gamma=0.95, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "symmetry"
 
     def compute_cumulant(self, state):
@@ -108,29 +87,16 @@ class SymmetryGVF(GVF):
 
         Symmetry = fraction of cells that match after mirroring
         """
-        if isinstance(state, np.ndarray):
-            # Extract grid from state
-            grid_size = 30 * 30
-            if len(state) >= grid_size:
-                grid = state[:grid_size].reshape(30, 30)
-
-                # Compute horizontal symmetry
-                h_sym = np.mean(grid == np.fliplr(grid))
-
-                # Compute vertical symmetry
-                v_sym = np.mean(grid == np.flipud(grid))
-
-                # Average symmetry
-                return (h_sym + v_sym) / 2.0
-
-        return 0.5  # Default
+        if isinstance(state, np.ndarray) and state.size > 1:
+            return float(np.clip(state[-1], 0.0, 1.0))
+        return 0.0
 
 
 class ProgressGVF(GVF):
     """g5: Predicts E[task progress] - how far along the transformation we are"""
 
-    def __init__(self, state_dim, hidden_size=128, gamma=0.95):
-        super().__init__(state_dim, hidden_size, gamma)
+    def __init__(self, state_dim, hidden_size=128, gamma=0.95, state_encoder=None, device=None):
+        super().__init__(state_dim, hidden_size, gamma, state_encoder=state_encoder, device=device)
         self.name = "progress"
 
     def compute_cumulant(self, state):
@@ -141,7 +107,7 @@ class ProgressGVF(GVF):
         This is similar to GridSimilarityGVF but with different γ for longer-term prediction
         """
         if isinstance(state, np.ndarray) and state.size > 0:
-            match_ratio = float(state[-1])
+            match_ratio = float(state[-4])
             return max(0.0, min(1.0, match_ratio))
         return 0.0
 
@@ -152,7 +118,7 @@ class ARCHordeGVFs:
     Updates all GVFs in parallel (OaK continual learning)
     """
 
-    def __init__(self, state_dim, config, meta_config=None):
+    def __init__(self, state_dim, config, meta_config=None, state_encoder=None, device=None):
         self.state_dim = state_dim
 
         # Create the 5 core GVFs for ARC
@@ -160,11 +126,11 @@ class ARCHordeGVFs:
         gvf_gamma = getattr(config, 'GVF_GAMMA', 0.95)
 
         self.gvfs = {
-            'grid_similarity': GridSimilarityGVF(state_dim, gvf_hidden, gvf_gamma),
-            'entropy': EntropyGVF(state_dim, gvf_hidden, gvf_gamma),
-            'object_count': ObjectCountGVF(state_dim, gvf_hidden, gvf_gamma),
-            'symmetry': SymmetryGVF(state_dim, gvf_hidden, gvf_gamma),
-            'progress': ProgressGVF(state_dim, gvf_hidden, 0.99),  # Longer horizon for progress
+            'grid_similarity': GridSimilarityGVF(state_dim, gvf_hidden, gvf_gamma, state_encoder=state_encoder, device=device),
+            'entropy': EntropyGVF(state_dim, gvf_hidden, gvf_gamma, state_encoder=state_encoder, device=device),
+            'object_count': ObjectCountGVF(state_dim, gvf_hidden, gvf_gamma, state_encoder=state_encoder, device=device),
+            'symmetry': SymmetryGVF(state_dim, gvf_hidden, gvf_gamma, state_encoder=state_encoder, device=device),
+            'progress': ProgressGVF(state_dim, gvf_hidden, 0.99, state_encoder=state_encoder, device=device),  # Longer horizon for progress
         }
 
         self.config = config
