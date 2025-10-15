@@ -169,65 +169,39 @@ echo "Configuration saved to ${CONFIG_FILE}"
 echo ""
 
 # ============================================================================
-# Build Command Line Arguments
+# Build Command Line Arguments (matching main.py argparse)
 # ============================================================================
 
+# Export environment variables for the config to use
+export ARC_DATA_PATH="${ARC_DATA_PATH}"
+export ARC_MAX_TRAINING_EXAMPLES="${ARC_MAX_TRAINING_EXAMPLES}"
+export ARC_REWARD_MODE="${ARC_REWARD_MODE}"
+export ARC_WORKING_GRID_SIZE="${ARC_WORKING_GRID_SIZE}"
+export ARC_ACTION_STRIDE="${ARC_ACTION_STRIDE}"
+export ARC_MAX_PAINT_ACTIONS="${ARC_MAX_PAINT_ACTIONS}"
+export ARC_MAX_FILL_ACTIONS="${ARC_MAX_FILL_ACTIONS}"
+export ARC_MAX_COPY_ACTIONS="${ARC_MAX_COPY_ACTIONS}"
+export ARC_MAX_EXEMPLAR_ACTIONS="${ARC_MAX_EXEMPLAR_ACTIONS}"
+export ARC_REWARD_MODEL_LR="${ARC_REWARD_MODEL_LR}"
+export ENCODER_LATENT_DIM="${ENCODER_LATENT_DIM}"
+export ENCODER_NUM_HEADS="${ENCODER_NUM_HEADS}"
+export ENCODER_NUM_LAYERS="${ENCODER_NUM_LAYERS}"
+
+# Determine config type
+CONFIG_TYPE="default"
+if [[ "${USE_CONTINUAL}" != "0" ]]; then
+  CONFIG_TYPE="continual"
+fi
+
+# Build simple argument list (main.py only accepts these)
 ARGS=(
-  --env-name "${ENV_NAME}"
+  --env "${ENV_NAME}"
+  --config-type "${CONFIG_TYPE}"
   --num-episodes "${NUM_EPISODES}"
-  --max-steps "${MAX_STEPS}"
-  --eval-interval "${EVAL_INTERVAL}"
   --seed "${SEED}"
-  --batch-size "${BATCH_SIZE}"
-  --lr "${LR}"
-  --gamma "${GAMMA}"
-  --epsilon-start "${EPSILON_START}"
-  --epsilon-end "${EPSILON_END}"
-  --epsilon-decay "${EPSILON_DECAY}"
-  --fc-stomp-interval "${FC_STOMP_INTERVAL}"
-  --dyna-steps "${DYNA_STEPS}"
-  --idbd-mu "${IDBD_MU}"
-  --output-dir "${OUTPUT_ROOT}"
-  --checkpoint-dir "${CHECKPOINT_DIR}"
-  --save-freq "${SAVE_FREQ}"
 )
 
-# ARC-specific arguments
-if [[ "${ENV_NAME,,}" == "arc" ]]; then
-  ARGS+=(
-    --arc-max-training-examples "${ARC_MAX_TRAINING_EXAMPLES}"
-    --arc-reward-mode "${ARC_REWARD_MODE}"
-    --arc-working-grid-size "${ARC_WORKING_GRID_SIZE}"
-    --arc-action-stride "${ARC_ACTION_STRIDE}"
-    --arc-max-paint-actions "${ARC_MAX_PAINT_ACTIONS}"
-    --arc-max-fill-actions "${ARC_MAX_FILL_ACTIONS}"
-    --arc-max-copy-actions "${ARC_MAX_COPY_ACTIONS}"
-    --arc-max-exemplar-actions "${ARC_MAX_EXEMPLAR_ACTIONS}"
-    --arc-data-path "${ARC_DATA_PATH}"
-    --arc-reward-model-lr "${ARC_REWARD_MODEL_LR}"
-    --encoder-latent-dim "${ENCODER_LATENT_DIM}"
-    --encoder-num-heads "${ENCODER_NUM_HEADS}"
-    --encoder-num-layers "${ENCODER_NUM_LAYERS}"
-  )
-fi
-
-# Conditional flags
-if [[ "${USE_CONTINUAL}" != "0" ]]; then
-  ARGS+=(--use-continual --initial-regime "${INITIAL_REGIME}")
-fi
-
-if [[ "${USE_DYNA}" == "0" ]]; then
-  ARGS+=(--no-dyna)
-fi
-
-if [[ "${USE_IDBD}" == "0" ]]; then
-  ARGS+=(--no-idbd)
-fi
-
-if [[ "${DEBUG_LOGGING}" != "0" ]]; then
-  ARGS+=(--debug)
-fi
-
+# Add ablation if specified
 if [[ "${ABLATION}" != "none" ]]; then
   ARGS+=(--ablation "${ABLATION}")
 fi
