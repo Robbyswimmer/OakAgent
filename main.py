@@ -26,6 +26,7 @@ import json
 import argparse
 import random
 from pathlib import Path
+from datetime import datetime
 
 from environments import create_environment, create_gvf_horde, load_config
 from encoders import create_state_encoder
@@ -48,6 +49,16 @@ class OaKAgent:
         self.env_name = env_name
         self.use_continual_env = use_continual_env
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Setup logging
+        log_dir = Path('log')
+        log_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_file = log_dir / f'oak_{env_name}_{timestamp}.log'
+        self.log_handle = open(self.log_file, 'w', buffering=1)  # Line buffered
+        self._log(f"OaK Agent initialized for {env_name} at {datetime.now()}")
+        self._log(f"Device: {self.device}")
+        self._log(f"Log file: {self.log_file}")
 
         # Create environment using factory
         env_kwargs = {}
@@ -301,6 +312,22 @@ class OaKAgent:
             if hasattr(self.env, 'set_mode'):
                 self.env.set_mode('train')
 
+    def _log(self, message):
+        """Log message to both stdout and log file with flush"""
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_msg = f"[{timestamp}] {message}"
+        print(log_msg, flush=True)
+        if hasattr(self, 'log_handle') and self.log_handle:
+            self.log_handle.write(log_msg + '\n')
+            self.log_handle.flush()
+
+    def close_log(self):
+        """Close log file"""
+        if hasattr(self, 'log_handle') and self.log_handle:
+            self._log("Closing log file")
+            self.log_handle.close()
+            self.log_handle = None
+
     def _compute_shaped_reward(self, state, next_state, env_reward, info):
         if not self.is_arc or self.reward_model is None:
             return env_reward, 0.0
@@ -322,6 +349,9 @@ class OaKAgent:
 
     def train(self, num_episodes):
         """Main training loop"""
+        self._log(f"Starting training for {num_episodes} episodes")
+        self._log(f"Environment: {self.env_name}")
+        self._log(f"Use continual: {self.use_continual_env}")
         for episode in range(num_episodes):
             if hasattr(self.env, 'set_mode'):
                 self.env.set_mode('train')
@@ -333,6 +363,7 @@ class OaKAgent:
 
             if self.env_name.lower() == 'arc':
                 self._prepare_arc_task(for_eval=False)
+                self._log(f"Episode {episode}: Starting ARC task")
 
             state = self.env.reset()
             done = False
@@ -525,18 +556,19 @@ class OaKAgent:
             # Logging
             if episode % self.config.LOG_FREQ == 0:
                 avg_return = np.mean(self.episode_returns[-10:])
-                print(f"Episode {episode}: Return={episode_return:.1f}, "
-                      f"Avg(10)={avg_return:.1f}, Steps={episode_length}, "
-                      f"Epsilon={self.epsilon:.3f}")
+                self._log(f"Episode {episode}: Return={episode_return:.1f}, "
+                         f"Avg(10)={avg_return:.1f}, Steps={episode_length}, "
+                         f"Epsilon={self.epsilon:.3f}")
 
             # Evaluation (no continual learning during intermediate evals for speed)
             if episode % self.config.EVAL_FREQ == 0 and episode > 0:
+                self._log(f"Running evaluation at episode {episode}")
                 eval_return = self.evaluate(self.config.EVAL_EPISODES, continual_learning=False)
-                print(f"  Evaluation: {eval_return:.1f}")
+                self._log(f"  Evaluation: {eval_return:.1f}")
 
                 # Check if solved
                 if eval_return >= self.config.TARGET_RETURN:
-                    print(f"SOLVED at episode {episode}!")
+                    self._log(f"SOLVED at episode {episode}!")
                     break
 
     def train_continual(self, num_episodes):
@@ -548,15 +580,15 @@ class OaKAgent:
         if not self.use_continual_env:
             raise ValueError("train_continual() requires use_continual_env=True")
 
-        print(f"\n{'='*60}")
-        print("CONTINUAL LEARNING MODE")
-        print(f"{'='*60}")
-        print(f"Regimes: {[r for r, _, _ in self.config.REGIME_SCHEDULE]}")
-        print(f"Total episodes: {num_episodes}")
-        print(f"Boundaries: {self.continual_metrics.regime_boundaries}")
+        self._log(f"\n{'='*60}")
+        self._log("CONTINUAL LEARNING MODE")
+        self._log(f"{'='*60}")
+        self._log(f"Regimes: {[r for r, _, _ in self.config.REGIME_SCHEDULE]}")
+        self._log(f"Total episodes: {num_episodes}")
+        self._log(f"Boundaries: {self.continual_metrics.regime_boundaries}")
         if getattr(self.config, 'EARLY_REGIME_SWITCH', False):
-            print(f"Early switch enabled: {self.config.REGIME_SOLVED_THRESHOLD:.1f} avg over {self.config.REGIME_SOLVED_WINDOW} episodes")
-        print(f"{'='*60}\n")
+            self._log(f"Early switch enabled: {self.config.REGIME_SOLVED_THRESHOLD:.1f} avg over {self.config.REGIME_SOLVED_WINDOW} episodes")
+        self._log(f"{'='*60}\n")
 
         current_regime = self.config.get_current_regime(0)
         regime_start_episode = 0
@@ -566,10 +598,10 @@ class OaKAgent:
             # Check for regime transition
             new_regime = self.config.get_current_regime(episode)
             if new_regime != current_regime:
-                print(f"\n{'='*60}")
-                print(f"[REGIME TRANSITION] Episode {episode}")
-                print(f"  {current_regime} → {new_regime}")
-                print(f"{'='*60}")
+                self._log(f"\n{'='*60}")
+                self._log(f"[REGIME TRANSITION] Episode {episode}")
+                self._log(f"  {current_regime} → {new_regime}")
+                self._log(f"{'='*60}")
 
                 # Switch regime (NO agent state reset!)
                 self.env.switch_regime(new_regime)
@@ -587,17 +619,17 @@ class OaKAgent:
                     old_epsilon = self.epsilon
                     boost_value = getattr(self.config, 'EPSILON_BOOST_VALUE', 0.5)
                     self.epsilon = max(self.epsilon, boost_value)
-                    print(f"  Epsilon boost: {old_epsilon:.3f} → {self.epsilon:.3f}")
+                    self._log(f"  Epsilon boost: {old_epsilon:.3f} → {self.epsilon:.3f}")
 
                 # Regime-aware option adaptation (Fix #6)
                 if getattr(self.config, 'REGIME_AWARE_PRUNING', True):
                     pruned = self.fc_stomp.trigger_regime_adaptation(current_step=self.total_steps)
-                    print(f"  Cleared {pruned} options for regime adaptation")
+                    self._log(f"  Cleared {pruned} options for regime adaptation")
 
                 # Optional: Evaluate at transition
                 if getattr(self.config, 'EVAL_AT_REGIME_TRANSITIONS', True):
                     pre_eval = self.evaluate(20, continual_learning=False)
-                    print(f"  Post-transition eval: {pre_eval:.1f}\n")
+                    self._log(f"  Post-transition eval: {pre_eval:.1f}\n")
 
                 # Optional ablations
                 if getattr(self.config, 'ABLATION_RESET_DYNAMICS_AT_TRANSITION', False):
@@ -759,11 +791,11 @@ class OaKAgent:
             # Logging
             if episode % self.config.LOG_FREQ == 0:
                 avg_return = np.mean(self.episode_returns[-10:])
-                print(f"Episode {episode} [{current_regime}]: Return={episode_return:.1f}, "
-                      f"Avg(10)={avg_return:.1f}, Epsilon={self.epsilon:.3f}")
+                self._log(f"Episode {episode} [{current_regime}]: Return={episode_return:.1f}, "
+                         f"Avg(10)={avg_return:.1f}, Epsilon={self.epsilon:.3f}")
 
                 if eval_return is not None:
-                    print(f"  Evaluation: {eval_return:.1f}")
+                    self._log(f"  Evaluation: {eval_return:.1f}")
 
             # Check for early regime switch if regime is solved
             if getattr(self.config, 'EARLY_REGIME_SWITCH', False):
@@ -782,11 +814,11 @@ class OaKAgent:
 
                         if recent_avg >= threshold:
                             # Regime solved! Switch to next regime early
-                            print(f"\n{'='*60}")
-                            print(f"[REGIME SOLVED] Episode {episode}")
-                            print(f"  {current_regime} solved with avg return {recent_avg:.1f} >= {threshold:.1f}")
-                            print(f"  Switching to next regime early...")
-                            print(f"{'='*60}\n")
+                            self._log(f"\n{'='*60}")
+                            self._log(f"[REGIME SOLVED] Episode {episode}")
+                            self._log(f"  {current_regime} solved with avg return {recent_avg:.1f} >= {threshold:.1f}")
+                            self._log(f"  Switching to next regime early...")
+                            self._log(f"{'='*60}\n")
 
                             # Check if there's a next regime
                             if current_regime_index + 1 < len(self.config.REGIME_SCHEDULE):
@@ -795,7 +827,7 @@ class OaKAgent:
                                 # Evaluate before transition
                                 if getattr(self.config, 'EVAL_AT_REGIME_TRANSITIONS', True):
                                     pre_transition_eval = self.evaluate(20, continual_learning=False)
-                                    print(f"  Pre-transition eval on {current_regime}: {pre_transition_eval:.1f}")
+                                    self._log(f"  Pre-transition eval on {current_regime}: {pre_transition_eval:.1f}")
 
                                 # Switch regime
                                 self.env.switch_regime(next_regime)
@@ -808,20 +840,20 @@ class OaKAgent:
                                     old_epsilon = self.epsilon
                                     boost_value = getattr(self.config, 'EPSILON_BOOST_VALUE', 0.5)
                                     self.epsilon = max(self.epsilon, boost_value)
-                                    print(f"  Epsilon boost: {old_epsilon:.3f} → {self.epsilon:.3f}")
+                                    self._log(f"  Epsilon boost: {old_epsilon:.3f} → {self.epsilon:.3f}")
 
                                 # Regime-aware option adaptation (Fix #6)
                                 if getattr(self.config, 'REGIME_AWARE_PRUNING', True):
                                     pruned = self.fc_stomp.trigger_regime_adaptation(current_step=self.total_steps)
-                                    print(f"  Cleared {pruned} options for regime adaptation")
+                                    self._log(f"  Cleared {pruned} options for regime adaptation")
 
                                 # Evaluate after transition
                                 if getattr(self.config, 'EVAL_AT_REGIME_TRANSITIONS', True):
                                     post_transition_eval = self.evaluate(20, continual_learning=False)
-                                    print(f"  Post-transition eval on {next_regime}: {post_transition_eval:.1f}\n")
+                                    self._log(f"  Post-transition eval on {next_regime}: {post_transition_eval:.1f}\n")
                             else:
                                 # All regimes complete!
-                                print(f"All regimes completed! Ending training.")
+                                self._log(f"All regimes completed! Ending training.")
                                 break
 
     def _update_all_components(self):
@@ -1233,6 +1265,9 @@ def main(env_name='cartpole', config_type='default'):
         json.dump(results, f, indent=2)
 
     print("\nResults saved to results/oak_cartpole_results.json")
+
+    # Close log file
+    agent.close_log()
 
 
 if __name__ == "__main__":
