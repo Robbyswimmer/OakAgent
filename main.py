@@ -1138,6 +1138,27 @@ class OaKAgent:
         if not all_tasks:
             raise RuntimeError(f'No ARC tasks found under {base_path}')
 
+        # Determine maximal exemplar count so buffers remain consistent across tasks
+        dataset_max_examples = getattr(self.env, 'max_training_examples', 0)
+        for task_path in all_tasks:
+            try:
+                with open(task_path, 'r') as f:
+                    task_json = json.load(f)
+                train_examples = task_json.get('train', [])
+                dataset_max_examples = max(dataset_max_examples, len(train_examples))
+            except Exception as exc:
+                self._log(f"Warning: Failed to inspect ARC task {task_path}: {exc}")
+
+        if dataset_max_examples > getattr(self.env, 'max_training_examples', 0):
+            if hasattr(self.env, '_ensure_exemplar_capacity'):
+                self.env._ensure_exemplar_capacity(dataset_max_examples)
+            else:
+                self.env.max_training_examples = dataset_max_examples
+                if hasattr(self.env, '_set_feature_buffers'):
+                    self.env._set_feature_buffers()
+            self.config.ARC_MAX_TRAINING_EXAMPLES = dataset_max_examples
+        self.arc_max_training_examples = dataset_max_examples
+
         def filter_tasks(task_list):
             if task_list is None:
                 return all_tasks.copy()
